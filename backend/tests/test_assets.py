@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.config import Settings
-from app.db import migrate
+from app.db import MIGRATIONS, migrate
 from app.main import create_app
 
 CSRF = {"x-nodecanvas-csrf": "1"}
@@ -177,6 +177,91 @@ def test_v1_database_migrates_with_backup(tmp_path: Path) -> None:
     migrate(db, tmp_path / "backups")
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT display_name FROM assets").fetchone()[0] == "old.png"
-    assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2]
+    assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")] == [v for v, _ in MIGRATIONS]
     conn.close()
     assert len(list((tmp_path / "backups").iterdir())) == 1
+
+
+def test_delete_assets_hides_them_and_moves_files_to_backups(ctx) -> None:
+    c, pid, settings = ctx
+    body = upload(c, pid, ("a.png", img_bytes(), "image/png"), ("b.png", img_bytes(), "image/png")).json()
+    a, b = (x["id"] for x in body["imported"])
+    res = c.post(f"/api/projects/{pid}/assets/delete", json={"asset_ids": [a, a]}, headers=CSRF)
+    assert res.status_code == 200 and res.json()["deleted"] == [a]
+
+    assert [x["id"] for x in c.get(f"/api/projects/{pid}/assets").json()] == [b]
+    info = c.get(f"/api/assets/{a}").json()
+    assert info["deleted"] is True and info["missing"] is True
+    assert c.get(f"/api/assets/{a}/file").status_code == 404
+    trash = settings.workspace_dir / "backups" / "deleted-assets" / pid
+    assert (trash / "assets" / f"{a}.png").is_file() and (trash / "thumbnails" / f"{a}.webp").is_file()
+    assert not (settings.workspace_dir / "projects" / pid / "assets" / f"{a}.png").exists()
+    # Deleting again is a no-op.
+    assert c.post(f"/api/projects/{pid}/assets/delete", json={"asset_ids": [a]}, headers=CSRF).json()["deleted"] == []
+
+
+def test_delete_assets_rejects_other_projects(ctx) -> None:
+    c, pid, _ = ctx
+    a = upload(c, pid, ("a.png", img_bytes(), "image/png")).json()["imported"][0]["id"]
+    other = c.post("/api/projects", json={"name": "Q"}, headers=CSRF).json()["id"]
+    res = c.post(f"/api/projects/{other}/assets/delete", json={"asset_ids": [a]}, headers=CSRF)
+    assert res.status_code == 404
+
+
+def test_extract_palette_ignores_transparent_pixels(ctx) -> None:
+    c, pid, _ = ctx
+    img = Image.new("RGBA", (40, 40), (0, 0, 0, 0))
+    for x in range(20):
+        for y in range(40):
+            img.putpixel((x, y), (255, 0, 0, 255))
+    for x in range(20, 30):
+        for y in range(40):
+            img.putpixel((x, y), (0, 0, 255, 255))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    a = upload(c, pid, ("shape.png", buf.getvalue(), "image/png")).json()["imported"][0]["id"]
+    res = c.get(f"/api/assets/{a}/palette?count=2")
+    assert res.status_code == 200
+    colors = res.json()["colors"]
+    assert [x["hex"] for x in colors] == ["#FF0000", "#0000FF"]  # no black from the transparent area
+    assert colors[0]["share"] > colors[1]["share"]
+    assert c.get("/api/assets/00000000-0000-0000-0000-000000000000/palette").status_code == 404
+
+
+def _near(hex_: str, rgb: tuple[int, int, int], within: int = 40) -> bool:
+    got = tuple(int(hex_[k : k + 2], 16) for k in (1, 3, 5))
+    return sum((a - b) ** 2 for a, b in zip(got, rgb, strict=True)) ** 0.5 <= within
+
+
+def test_extract_palette_drops_a_plain_backdrop_and_picks_distinct_colors(ctx) -> None:
+    c, pid, _ = ctx
+    img = Image.new("RGB", (60, 60), (254, 254, 254))  # opaque white backdrop (not transparent)
+    for x in range(10, 30):
+        for y in range(10, 50):
+            img.putpixel((x, y), (230, 40, 30))  # red, 800 px
+    for x in range(30, 50):
+        for y in range(10, 50):
+            img.putpixel((x, y), (40, 170, 60))  # green, 800 px
+    for x in range(34, 40):
+        for y in range(20, 26):
+            img.putpixel((x, y), (255, 255, 255))  # white detail inside the subject: not backdrop
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    a = upload(c, pid, ("dragon.png", buf.getvalue(), "image/png")).json()["imported"][0]["id"]
+    colors = c.get(f"/api/assets/{a}/palette?count=5").json()["colors"]
+    hexes = [x["hex"] for x in colors]
+    # The two real colours lead; the backdrop (about 1/3 of the image) does not appear as a big white swatch.
+    assert {_near(h, (230, 40, 30)) for h in hexes[:2]} == {True, False}
+    assert {_near(h, (40, 170, 60)) for h in hexes[:2]} == {True, False}
+    for h, x in zip(hexes, colors, strict=True):
+        if _near(h, (254, 254, 254), 20):
+            assert x["share"] <= 5  # only the small white detail inside the subject
+    assert len(set(hexes)) == len(hexes)  # no repeated shades
+    assert sum(x["share"] for x in colors) in range(98, 103)
+
+
+def test_extract_palette_keeps_a_flat_image(ctx) -> None:
+    c, pid, _ = ctx
+    a = upload(c, pid, ("flat.png", img_bytes("PNG", size=(30, 30)), "image/png")).json()["imported"][0]["id"]
+    colors = c.get(f"/api/assets/{a}/palette").json()["colors"]
+    assert [x["hex"] for x in colors] == ["#FF0000"] and colors[0]["share"] == 100

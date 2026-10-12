@@ -4,17 +4,20 @@ import type {
   CollectionData,
   GenerateData,
   ImageData,
-  OriginalData,
   OutputData,
   PaletteData,
   PromptData,
-  ThemeData,
 } from '../graph/types';
+import { aspectLabel } from '../graph/types';
 import { AssetCaption, AssetThumb, MiniThumb } from '../components/AssetThumb';
 import { MunLoader } from '../components/MunLoader';
+import { estimateTasks } from '../graph/generation';
 import { useImageImport } from '../hooks/useImageImport';
+import { formatDuration, useBatchTime } from '../hooks/useBatchTime';
+import { useImageRoles } from '../hooks/useImageRoles';
 import { pickImageFiles } from '../lib/filePicker';
 import { useAssetStore } from '../store/assetStore';
+import { isRunning, latestBatchFor, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
 import { useGraphStore } from '../store/graphStore';
 import { NodeShell } from './NodeShell';
 
@@ -43,7 +46,10 @@ function PromptNode(props: P) {
   const data = props.data as PromptData;
   const updateNodeData = useGraphStore((s) => s.updateNodeData);
   return (
-    <NodeShell node={props} badge={!data.enabled && <span className="text-[10px] text-ink-3">Off</span>}>
+    <NodeShell
+      node={props}
+      badge={<span className="text-[10px] uppercase tracking-wide text-ink-3">{data.enabled ? data.assetCategory : 'Off'}</span>}
+    >
       {/* nodrag/nowheel: typing, selecting text and scrolling stay inside the field instead of moving the canvas. */}
       <textarea
         aria-label="Main prompt"
@@ -59,34 +65,23 @@ function PromptNode(props: P) {
   );
 }
 
-function ImageLikeNode(props: P) {
+function ImageNode(props: P) {
   const data = props.data as ImageData;
-  return (
-    <NodeShell node={props} width={200}>
-      <NodeImage nodeId={props.id} assetId={data.assetId} />
-    </NodeShell>
-  );
-}
-
-function OriginalNode(props: P) {
-  const data = props.data as OriginalData;
-  const kept = Object.entries(data.preserve)
+  const roles = useImageRoles(props.id);
+  const preserved = Object.entries(data.preserve ?? {})
     .filter(([, on]) => on)
     .map(([k]) => k);
   return (
-    <NodeShell node={props} width={200}>
+    <NodeShell
+      node={props}
+      width={200}
+      badge={roles.length > 0 && <span className="text-[10px] uppercase tracking-wide text-ink-3">{roles.join(' · ')}</span>}
+    >
       <NodeImage nodeId={props.id} assetId={data.assetId} />
-      {kept.length > 0 && <p className="mt-2 text-[11px] text-ink-3">Preserve: {kept.join(', ')}</p>}
-    </NodeShell>
-  );
-}
-
-function ThemeNode(props: P) {
-  const data = props.data as ThemeData;
-  return (
-    <NodeShell node={props} width={200}>
-      <NodeImage nodeId={props.id} assetId={data.assetId} />
-      <p className="mt-1 text-[11px] text-ink-3">{data.roles.join(', ') || 'No role'}</p>
+      {roles.includes('Original') && preserved.length > 0 && (
+        <p className="mt-2 text-[11px] text-ink-3">Preserve: {preserved.join(', ')}</p>
+      )}
+      {roles.includes('Theme') && <p className="mt-1 text-[11px] text-ink-3">Theme: {data.roles.join(', ') || 'no role'}</p>}
     </NodeShell>
   );
 }
@@ -112,10 +107,17 @@ function PaletteNode(props: P) {
 }
 
 const PREVIEW_SLOTS = 8;
+/** Batches larger than this ask for confirmation: every image is a request against the user's quota. */
+const CONFIRM_ABOVE = 4;
+const nodeBtn =
+  'nodrag rounded-md border-2 border-outline bg-node px-2 py-0.5 text-[11px] font-medium text-ink hover:bg-accent-soft';
 
 function CollectionNode(props: P) {
   const data = props.data as CollectionData;
   const items = data.items ?? [];
+  const lastBatchId = data.role === 'output' ? data.batchIds?.at(-1) : undefined;
+  const batch = useGenerationStore((s) => (lastBatchId ? s.batches[lastBatchId] : undefined));
+  const outTime = useBatchTime(lastBatchId);
   const importImages = useImageImport();
   const enabled = items.filter((i) => i.enabled).length;
   const shown = items.slice(0, PREVIEW_SLOTS);
@@ -172,6 +174,14 @@ function CollectionNode(props: P) {
           </div>
         </button>
       )}
+      {batch && (
+        <p className="mt-2 text-[11px] text-ink-2">
+          Latest run: {batch.completed_count}/{batch.expected_count} done
+          {batch.failed_count > 0 && <span className="text-danger"> · {batch.failed_count} failed</span>}
+          {isRunning(batch) && <span> · running</span>}
+          {outTime && <span className="font-mono tabular-nums"> · {formatDuration(outTime.ms)}</span>}
+        </p>
+      )}
       <div className="mt-2 flex items-center gap-2 text-[12px]">
         <span className="text-ink-2">
           {items.length} {items.length === 1 ? 'image' : 'images'}
@@ -195,32 +205,83 @@ function GenerateNode(props: P) {
   const data = props.data as GenerateData;
   const originals = useNodeConnections({ handleType: 'target', handleId: 'original' });
   const prompts = useNodeConnections({ handleType: 'target', handleId: 'prompt' });
-  const generating = useGraphStore((s) => Boolean(s.generatingNodeIds[props.id]));
+  const expected = useGraphStore((s) => estimateTasks(s.nodes, s.edges, props.id));
+  const batch = useGenerationStore((s) => latestBatchFor(s.batches, props.id));
+  const starting = useGenerationStore((s) => Boolean(s.starting[props.id]));
+  const running = isRunning(batch);
+  const time = useBatchTime(batch?.id);
+  const open = batch && OPEN_STATUSES.includes(batch.status);
+  const { start, resume, retry } = useGenerationStore.getState();
+
+  const problems = [
+    prompts.length === 0 && 'Needs a prompt',
+    data.mode === 'match' && originals.length === 0 && 'Needs original images',
+    data.mode === 'match' && originals.length > 0 && expected === 0 && 'No enabled originals',
+  ].filter(Boolean) as string[];
   const summary =
     data.mode === 'manual'
       ? `Manual · ${data.outputCount} output${data.outputCount === 1 ? '' : 's'}`
       : `Match inputs · ×${data.variantsPerInput} per original`;
+  const done = batch ? batch.completed_count + batch.failed_count + batch.cancelled_count : 0;
+
   return (
     <NodeShell node={props} width={260}>
       <div className="space-y-1 text-[12px] text-ink-2">
         <p>{summary}</p>
         <p className="text-ink-3">
-          {data.aspectRatio} · {data.outputFormat.toUpperCase()} · {data.assetCategory}
+          {aspectLabel(data.aspectRatio)} · quality {data.quality}
         </p>
-        {prompts.length === 0 && <p className="text-warning">Needs a prompt</p>}
-        {data.mode === 'match' && originals.length === 0 && <p className="text-warning">Needs original images</p>}
+        {problems.map((p) => (
+          <p key={p} className="text-warning">
+            {p}
+          </p>
+        ))}
       </div>
-      {generating && <MunLoader label={null} className="mt-3" />}
+      {running && <MunLoader label={null} className="mt-3" />}
+      {batch && (open || batch.failed_count > 0) && (
+        <div className="mt-2 space-y-1.5 text-[11px]">
+          <div className="h-1.5 overflow-hidden rounded-full border border-outline bg-panel-2" aria-hidden>
+            <div className="h-full bg-success" style={{ width: `${(100 * done) / Math.max(1, batch.expected_count)}%` }} />
+          </div>
+          <p className="text-ink-2">
+            {batch.completed_count}/{batch.expected_count} done
+            {batch.failed_count > 0 && <span className="text-danger"> · {batch.failed_count} failed</span>}
+            {batch.cancelled_count > 0 && <span> · {batch.cancelled_count} cancelled</span>}
+            {time && (
+              <span className="font-mono tabular-nums" title="Time spent generating (waiting and pauses not counted)">
+                {' · '}
+                {time.live ? '⏱ ' : 'took '}
+                {formatDuration(time.ms)}
+              </span>
+            )}
+          </p>
+          {batch.status_reason && !running && <p className="text-warning">{batch.status_reason}</p>}
+          <div className="flex gap-1.5">
+            {(batch.status === 'paused' || batch.status === 'interrupted') && batch.active_count > 0 && (
+              <button type="button" className={nodeBtn} onClick={() => void resume(batch.id)}>
+                Resume
+              </button>
+            )}
+            {!running && batch.failed_count > 0 && (
+              <button type="button" className={nodeBtn} onClick={() => void retry(batch.id)}>
+                Retry failed
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       <button
         type="button"
-        disabled
-        aria-busy={generating}
-        className={`nodrag mt-2 w-full cursor-not-allowed rounded-lg border-2 border-outline bg-accent py-1.5 text-[12px] font-semibold text-accent-ink ${
-          generating ? '' : 'opacity-40'
-        }`}
-        title={generating ? undefined : 'Generation arrives with the AI workflow phase'}
+        disabled={running || starting || problems.length > 0 || data.locked}
+        aria-busy={running || starting}
+        onClick={() => {
+          if (expected > CONFIRM_ABOVE && !window.confirm(`Generate ${expected} images? Each one is a separate request to your account.`)) return;
+          void start(props.id);
+        }}
+        className="nodrag mt-2 w-full rounded-lg border-2 border-outline bg-accent py-1.5 text-[12px] font-semibold text-accent-ink hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
+        title={problems[0]}
       >
-        {generating ? 'Generating…' : 'Generate'}
+        {running ? 'Generating…' : starting ? 'Starting…' : expected > 1 ? `Generate ${expected}` : 'Generate'}
       </button>
     </NodeShell>
   );
@@ -241,9 +302,7 @@ function OutputNode(props: P) {
 
 export const nodeTypes: NodeTypes = {
   prompt: PromptNode,
-  image: ImageLikeNode,
-  original: OriginalNode,
-  theme: ThemeNode,
+  image: ImageNode,
   palette: PaletteNode,
   collection: CollectionNode,
   generate: GenerateNode,

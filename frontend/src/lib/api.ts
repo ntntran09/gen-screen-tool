@@ -5,10 +5,13 @@ const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api';
 export class ApiError extends Error {
   readonly code: string;
   readonly status: number;
-  constructor(status: number, code: string, message: string) {
+  /** Every validation problem, when the backend reports more than one. */
+  readonly errors: string[];
+  constructor(status: number, code: string, message: string, errors: string[] = []) {
     super(message);
     this.status = status;
     this.code = code;
+    this.errors = errors.length ? errors : [message];
   }
 }
 
@@ -26,7 +29,12 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     const err = json?.error;
-    throw new ApiError(res.status, err?.code ?? 'UNKNOWN_ERROR', err?.message ?? `Request failed (${res.status}).`);
+    throw new ApiError(
+      res.status,
+      err?.code ?? 'UNKNOWN_ERROR',
+      err?.message ?? `Request failed (${res.status}).`,
+      Array.isArray(err?.errors) ? err.errors : [],
+    );
   }
   return json as T;
 }
@@ -94,6 +102,11 @@ export const api = {
   deleteProject: (id: string) => request<void>('DELETE', `/projects/${encodeURIComponent(id)}`),
   listProviders: () => request<ProviderInfo[]>('GET', '/providers'),
   listAssets: (projectId: string) => request<AssetInfo[]>('GET', `/projects/${encodeURIComponent(projectId)}/assets`),
+  deleteAssets: (projectId: string, assetIds: string[]) =>
+    request<{ deleted: string[] }>('POST', `/projects/${encodeURIComponent(projectId)}/assets/delete`, { asset_ids: assetIds }),
+  assetPalette: (id: string, count: number) =>
+    request<{ colors: { hex: string; share: number }[] }>('GET', `/assets/${encodeURIComponent(id)}/palette?count=${count}`),
+  getAsset: (id: string) => request<AssetInfo>('GET', `/assets/${encodeURIComponent(id)}`),
   renameAsset: (id: string, name: string) => request<AssetInfo>('PATCH', `/assets/${encodeURIComponent(id)}`, { name }),
   importAssets: async (projectId: string, files: File[]): Promise<ImportResult> => {
     const form = new FormData();
@@ -119,7 +132,132 @@ export const api = {
   disconnect: (providerId = 'codex') => request<AuthStatus>('POST', '/auth/disconnect', { provider_id: providerId }),
   testProvider: (providerId: string, body: { confirm_quota_use: boolean; prompt?: string }) =>
     request<ProviderTestResult>('POST', `/providers/${encodeURIComponent(providerId)}/test`, body),
+  previewGeneration: (body: GenerationBody) => request<GenerationPreview>('POST', '/generations/preview', body),
+  startGeneration: (body: GenerationBody) =>
+    request<{ batch: GenerationBatch; tasks: GenerationTask[] }>('POST', '/generations', body),
+  listGenerations: (projectId: string) =>
+    request<GenerationBatch[]>('GET', `/generations?project_id=${encodeURIComponent(projectId)}`),
+  generationTasks: (batchId: string) => request<GenerationTask[]>('GET', `/generations/${encodeURIComponent(batchId)}/tasks`),
+  cancelGeneration: (batchId: string) =>
+    request<{ batch: GenerationBatch; note: string | null }>('POST', `/generations/${encodeURIComponent(batchId)}/cancel`),
+  retryGeneration: (batchId: string, taskIds?: string[]) =>
+    request<{ batch: GenerationBatch; retried: number }>('POST', `/generations/${encodeURIComponent(batchId)}/retry`, {
+      task_ids: taskIds ?? null,
+    }),
+  resumeGeneration: (batchId: string) =>
+    request<{ batch: GenerationBatch }>('POST', `/generations/${encodeURIComponent(batchId)}/resume`),
 };
+
+export const generationEventsUrl = (projectId: string) =>
+  `${BASE}/generations/events?project_id=${encodeURIComponent(projectId)}`;
+
+export interface GenerationBody {
+  project_id: string;
+  generate_node_id: string;
+  graph: GraphPayload;
+  /** Client-chosen id for a new batch (so its result node can be saved first). */
+  batch_id?: string;
+}
+
+export type BatchStatus =
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'interrupted'
+  | 'completed'
+  | 'partially_completed'
+  | 'failed'
+  | 'cancelled';
+
+export type TaskStatus =
+  | 'queued'
+  | 'preparing'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancel_requested'
+  | 'cancelled'
+  | 'interrupted';
+
+export interface GenerationBatch {
+  id: string;
+  project_id: string;
+  generate_node_id: string;
+  name: string;
+  provider_id: string;
+  mode: 'manual' | 'match';
+  status: BatchStatus;
+  status_reason: string | null;
+  expected_count: number;
+  completed_count: number;
+  failed_count: number;
+  cancelled_count: number;
+  active_count: number;
+  cancel_requested: boolean;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface GenerationTask {
+  id: string;
+  batch_id: string;
+  project_id: string;
+  slot_index: number;
+  attempt_number: number;
+  variant_index: number;
+  source_asset_id: string | null;
+  source_name: string | null;
+  status: TaskStatus;
+  prompt: string;
+  request: {
+    operation: 'generate' | 'edit';
+    original_asset_id: string | null;
+    theme_asset_ids: string[];
+    reference_asset_ids: string[];
+    settings: Record<string, string>;
+  };
+  output_asset_id: string | null;
+  result: {
+    width: number;
+    height: number;
+    mime_type: string;
+    has_alpha: boolean;
+    file_size: number;
+    reported_model: string | null;
+    reported_settings: Record<string, unknown>;
+  } | null;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface GenerationPreview {
+  ok: boolean;
+  errors: string[];
+  provider?: {
+    id: string;
+    name: string;
+    experimental: boolean;
+    auth_state: AuthState;
+    capabilities: Record<string, unknown>;
+  } | null;
+  mode?: 'manual' | 'match';
+  settings?: Record<string, string>;
+  theme_asset_ids?: string[];
+  reference_asset_ids?: string[];
+  palette?: { hex: string; role: string; ratio: number | null }[];
+  total_tasks: number;
+  tasks: {
+    slot_index: number;
+    variant_index: number;
+    source_asset_id: string | null;
+    source_name: string | null;
+    operation: 'generate' | 'edit';
+    prompt: string;
+  }[];
+}
 
 export type AuthState =
   | 'not_connected'
@@ -166,6 +304,8 @@ export interface AssetInfo {
   origin: string;
   created_at: string;
   missing: boolean;
+  /** Removed from the library; the file was moved to backups. */
+  deleted?: boolean;
 }
 
 export interface ImportResult {

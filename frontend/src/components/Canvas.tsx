@@ -1,8 +1,9 @@
 import {
   Background,
   BackgroundVariant,
-  Controls,
+  ControlButton,
   MiniMap,
+  Panel,
   SelectionMode,
   ReactFlow,
   useReactFlow,
@@ -11,16 +12,76 @@ import {
   type FinalConnectionState,
   type IsValidConnection,
 } from '@xyflow/react';
-import { useCallback, useEffect, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type DragEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from 'react';
 import { getDefinition, isNodeKind } from '../graph/registry';
 import type { CanvasEdge, CanvasNode, CollectionData, NodeKind } from '../graph/types';
 import { checkConnection } from '../graph/validation';
 import { nodeTypes } from '../nodes/nodeTypes';
-import { useGraphStore } from '../store/graphStore';
+import { isNodeFrozen, isNodeLocked, useGraphStore, type CanvasTool } from '../store/graphStore';
 import { isSupportedImage, useAssetPlacement, useImageImport, type ImportTarget } from '../hooks/useImageImport';
 import { isTypingTarget } from '../hooks/useShortcuts';
 import { useAssetStore } from '../store/assetStore';
 import { AddNodeMenu } from './AddNodeMenu';
+import { ContextMenu, type MenuItem } from './ContextMenu';
+
+const ICON = {
+  width: 16,
+  height: 16,
+  viewBox: '0 0 24 24',
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 2,
+  strokeLinecap: 'round',
+  strokeLinejoin: 'round',
+} as const;
+
+const TOOLS: { id: CanvasTool; label: string; key: string; icon: ReactNode }[] = [
+  {
+    id: 'select',
+    label: 'Select',
+    key: 'V',
+    icon: (
+      <svg {...ICON} className="tool-icon" aria-hidden>
+        <path d="M5 3l14 7-6 2-2 6z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'pan',
+    label: 'Hand: drag to pan',
+    key: 'H',
+    icon: (
+      <svg {...ICON} className="tool-icon" aria-hidden>
+        <path d="M18 11V6a2 2 0 0 0-4 0v5M14 10V4a2 2 0 0 0-4 0v6M10 10.5V6a2 2 0 0 0-4 0v8" />
+        <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-6-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15" />
+      </svg>
+    ),
+  },
+  {
+    id: 'eraser',
+    label: 'Eraser: click or drag over nodes and connections to delete them',
+    key: 'E',
+    icon: (
+      <svg {...ICON} className="tool-icon" aria-hidden>
+        <path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+        <path d="M22 21H7" />
+        <path d="m5 11 9 9" />
+      </svg>
+    ),
+  },
+];
+
+type ItemMenu = { x: number; y: number; title: string; items: MenuItem[] };
+
+let strokeSeq = 0;
 
 export const DRAG_MIME = 'application/x-nodecanvas-node';
 /** Library drag payload: JSON array of { id, name } for stored assets. */
@@ -30,10 +91,10 @@ export const ASSET_DRAG_MIME = 'application/x-nodecanvas-assets';
 function dropTarget(e: DragEvent, count: number): ImportTarget {
   const nodeId = (e.target as HTMLElement).closest<HTMLElement>('.react-flow__node')?.dataset.id;
   const node = nodeId ? useGraphStore.getState().nodes.find((n) => n.id === nodeId) : undefined;
-  if (node && !node.data.locked) {
+  if (node && !isNodeLocked(node)) {
     if (node.type === 'collection' && (node.data as CollectionData).role === 'input') return { collectionNodeId: node.id };
     // Dropping a single image onto an image node replaces it; several images start a new group instead.
-    if (count === 1 && ['image', 'original', 'theme'].includes(node.type!)) return { replaceNodeId: node.id };
+    if (count === 1 && node.type === 'image') return { replaceNodeId: node.id };
   }
   // Alt keeps separate nodes; otherwise several images become one collection.
   return { screen: { x: e.clientX, y: e.clientY }, group: !e.altKey };
@@ -51,11 +112,84 @@ export function Canvas() {
   const commit = useGraphStore((s) => s.commit);
   const setViewport = useGraphStore((s) => s.setViewport);
   const showToast = useGraphStore((s) => s.showToast);
-  const { screenToFlowPosition, setViewport: applyViewport } = useReactFlow();
+  const { screenToFlowPosition, setViewport: applyViewport, zoomIn, zoomOut, fitView } = useReactFlow();
   const importImages = useImageImport();
   const placeAssets = useAssetPlacement();
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [itemMenu, setItemMenu] = useState<ItemMenu | null>(null);
+  const tool = useGraphStore((s) => s.tool);
+  const setTool = useGraphStore((s) => s.setTool);
   const wrapper = useRef<HTMLDivElement>(null);
+  // Active eraser stroke (left button held); its key makes the whole stroke one undo step.
+  const stroke = useRef<string | null>(null);
+
+  const erase = useCallback(
+    (items: { nodeIds?: string[]; edgeIds?: string[] }, key?: string) => {
+      const kept = useGraphStore.getState().eraseItems(items, key);
+      if (kept > 0) showToast('Locked nodes cannot be deleted. Unlock them first.');
+    },
+    [showToast],
+  );
+
+  useEffect(() => {
+    const end = () => {
+      stroke.current = null;
+    };
+    window.addEventListener('pointerup', end);
+    return () => window.removeEventListener('pointerup', end);
+  }, []);
+
+  const onNodeContextMenu = useCallback(
+    (e: ReactMouseEvent, node: CanvasNode) => {
+      e.preventDefault();
+      setMenu(null);
+      setItemMenu({
+        x: e.clientX,
+        y: e.clientY,
+        title: String(node.data.title || getDefinition(node.type!).label),
+        items: [
+          {
+            label: 'Duplicate',
+            onSelect: () => {
+              const s = useGraphStore.getState();
+              useGraphStore.setState({ nodes: s.nodes.map((n) => ({ ...n, selected: n.id === node.id })) });
+              useGraphStore.getState().duplicateSelected();
+            },
+          },
+          {
+            label: 'Delete node',
+            danger: true,
+            disabled: isNodeLocked(node),
+            hint: isNodeFrozen(node.id) ? 'Generating: it can be deleted when the run ends' : node.data.locked ? 'Locked nodes cannot be deleted' : undefined,
+            onSelect: () => erase({ nodeIds: [node.id] }),
+          },
+        ],
+      });
+    },
+    [erase],
+  );
+
+  const onEdgeContextMenu = useCallback(
+    (e: ReactMouseEvent, edge: CanvasEdge) => {
+      e.preventDefault();
+      setMenu(null);
+      setItemMenu({
+        x: e.clientX,
+        y: e.clientY,
+        title: 'Connection',
+        items: [
+          {
+            label: 'Delete connection',
+            danger: true,
+            disabled: isNodeFrozen(edge.source) || isNodeFrozen(edge.target),
+            hint: 'A node on this connection is generating',
+            onSelect: () => erase({ edgeIds: [edge.id] }),
+          },
+        ],
+      });
+    },
+    [erase],
+  );
 
   // Restore the saved viewport whenever a different project is loaded.
   useEffect(() => {
@@ -174,7 +308,14 @@ export function Canvas() {
   );
 
   return (
-    <div ref={wrapper} className="relative h-full w-full" onDoubleClick={onDoubleClick}>
+    <div
+      ref={wrapper}
+      className={`relative h-full w-full tool-${tool}`}
+      onDoubleClick={onDoubleClick}
+      onPointerDownCapture={(e) => {
+        if (tool === 'eraser' && e.button === 0) stroke.current = `erase:${++strokeSeq}`;
+      }}
+    >
       <ReactFlow<CanvasNode, CanvasEdge>
         nodes={nodes}
         edges={edges}
@@ -187,11 +328,29 @@ export function Canvas() {
         isValidConnection={isValidConnection}
         onNodeDragStart={() => commit()}
         onNodeDoubleClick={onNodeDoubleClick}
+        onNodeContextMenu={onNodeContextMenu}
+        onEdgeContextMenu={onEdgeContextMenu}
+        onNodeClick={(_, node) => {
+          if (tool === 'eraser') erase({ nodeIds: [node.id] }, stroke.current ?? undefined);
+        }}
+        onEdgeClick={(_, edge) => {
+          if (tool === 'eraser') erase({ edgeIds: [edge.id] }, stroke.current ?? undefined);
+        }}
+        onNodeMouseEnter={(_, node) => {
+          if (stroke.current) erase({ nodeIds: [node.id] }, stroke.current);
+        }}
+        onEdgeMouseEnter={(_, edge) => {
+          if (stroke.current) erase({ edgeIds: [edge.id] }, stroke.current);
+        }}
+        nodesDraggable={tool !== 'eraser'}
+        nodesConnectable={tool !== 'eraser'}
+        elementsSelectable={tool !== 'eraser'}
         onMoveEnd={(_, vp) => setViewport(vp)}
         onDragOver={onDragOver}
         onDrop={onDrop}
         onPaneContextMenu={(e) => {
           e.preventDefault();
+          setItemMenu(null);
           openMenuAt(e.clientX, e.clientY);
         }}
         colorMode="light"
@@ -201,18 +360,57 @@ export function Canvas() {
         multiSelectionKeyCode="Shift"
         panActivationKeyCode="Space"
         zoomOnDoubleClick={false}
-        // Left-drag on empty canvas draws a selection box; anything it touches is selected.
-        // The middle button (or Space+drag) pans.
-        selectionOnDrag
+        // Select tool: left-drag on empty canvas draws a selection box (anything it touches is selected).
+        // Hand tool: left-drag pans. The middle button (or Space+drag) always pans.
+        selectionOnDrag={tool === 'select'}
         selectionMode={SelectionMode.Partial}
-        panOnDrag={[1]}
+        panOnDrag={tool === 'pan' ? [0, 1] : [1]}
+        // Dropping a connection near a handle (not exactly on it) still connects.
+        connectionRadius={36}
         minZoom={0.1}
         maxZoom={2.5}
         proOptions={{ hideAttribution: true }}
         defaultEdgeOptions={{ type: 'default' }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} color="#d9cfc2" />
-        <Controls showInteractive={false} position="bottom-left" />
+        {/* Two boxes: tools on top, zoom underneath. */}
+        <Panel position="bottom-left" className="flex flex-col gap-2">
+          <div className="react-flow__controls vertical" role="toolbar" aria-label="Canvas tools">
+            {TOOLS.map((t) => (
+              <ControlButton
+                key={t.id}
+                onClick={() => setTool(t.id)}
+                title={`${t.label} (${t.key})`}
+                aria-label={t.label}
+                aria-pressed={tool === t.id}
+                className={tool === t.id ? 'tool-active' : undefined}
+              >
+                {t.icon}
+              </ControlButton>
+            ))}
+          </div>
+          <div className="react-flow__controls vertical" role="toolbar" aria-label="Zoom">
+            <ControlButton onClick={() => void zoomIn({ duration: 150 })} title="Zoom in (+)" aria-label="Zoom in">
+              <svg {...ICON} className="tool-icon" aria-hidden>
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </ControlButton>
+            <ControlButton onClick={() => void zoomOut({ duration: 150 })} title="Zoom out (-)" aria-label="Zoom out">
+              <svg {...ICON} className="tool-icon" aria-hidden>
+                <path d="M5 12h14" />
+              </svg>
+            </ControlButton>
+            <ControlButton
+              onClick={() => void fitView({ padding: 0.2, duration: 200 })}
+              title="Fit all (Shift+1)"
+              aria-label="Fit all nodes"
+            >
+              <svg {...ICON} className="tool-icon" aria-hidden>
+                <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+              </svg>
+            </ControlButton>
+          </div>
+        </Panel>
         <MiniMap
           pannable
           zoomable
@@ -233,6 +431,7 @@ export function Canvas() {
         </div>
       )}
       {menu && <AddNodeMenu x={menu.x} y={menu.y} onPick={pick} onClose={() => setMenu(null)} />}
+      {itemMenu && <ContextMenu {...itemMenu} onClose={() => setItemMenu(null)} />}
     </div>
   );
 }

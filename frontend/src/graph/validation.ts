@@ -5,6 +5,11 @@ import type { CanvasEdge, CanvasNode, CollectionData } from './types';
 export interface ConnectionCheck {
   ok: boolean;
   reason?: string;
+  /**
+   * A port that takes one connection already has these edges. Connecting replaces them: the
+   * caller removes them together with adding the new edge.
+   */
+  replaces?: string[];
 }
 
 /** Would adding source→target create a dependency cycle? (spec §25.3) */
@@ -65,12 +70,9 @@ export function checkConnection(
   if (existing.some((e) => e.source === source.id && e.sourceHandle === conn.sourceHandle)) {
     return { ok: false, reason: 'These nodes are already connected.' };
   }
-  if (!port.multiple && existing.length > 0) {
-    return { ok: false, reason: `${targetLabel} accepts only one connection.` };
-  }
-
+  const replaces = !port.multiple ? existing.map((e) => e.id) : [];
   if (createsCycle(edges, source.id, target.id)) {
     return { ok: false, reason: 'This connection would create a loop.' };
   }
-  return { ok: true };
+  return replaces.length ? { ok: true, replaces } : { ok: true };
 }

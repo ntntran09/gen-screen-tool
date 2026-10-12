@@ -22,6 +22,8 @@ Open http://127.0.0.1:5173.
 
 Data is stored in `workspace/NodeCanvasAI/` (override with `NODECANVAS_WORKSPACE`).
 
+To try generation without using ChatGPT quota, start the backend with `NODECANVAS_FAKE_PROVIDER=1` and pick "Local placeholder (testing)" as the Generate node's provider (better with a separate `NODECANVAS_WORKSPACE`).
+
 ## Tests
 
 ```bash
@@ -34,9 +36,9 @@ cd frontend && npx vitest run && npx tsc -b
 
 ## Layout
 
-- `backend/app/` — FastAPI app: `db.py` (schema + migrations), `routers/` (projects, providers), `providers/` (adapter interface; Codex stub), `security.py` (Host/Origin/CSRF guard).
+- `backend/app/` — FastAPI app: `db.py` (schema + migrations), `routers/` (projects, assets, auth, providers, generations), `providers/` (adapter interface, Codex, local placeholder), `generation/` (`plan.py` validation + prompt compilation, `engine.py` queue worker + SSE bus), `security.py` (Host/Origin/CSRF guard).
 - `frontend/src/graph/` — node registry, port types and connection validation (pure, unit-tested).
-- `frontend/src/store/` — Zustand graph store: undo/redo, copy/paste, lock handling.
+- `frontend/src/store/` — Zustand stores: graph (undo/redo, copy/paste, result placement), assets, generation (batches, tasks, SSE).
 - `frontend/src/nodes/`, `frontend/src/components/` — canvas UI, inspector, sidebar, toolbar.
 
 ## Canvas shortcuts

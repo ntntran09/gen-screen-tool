@@ -25,8 +25,8 @@ const conn = (source: string, target: string, targetHandle: string) => ({
 describe('checkConnection', () => {
   const nodes = [
     node('p', 'prompt'),
-    node('o', 'original'),
-    node('t', 'theme'),
+    node('o', 'image'),
+    node('t', 'image'),
     node('pal1', 'palette'),
     node('pal2', 'palette'),
     node('img', 'image'),
@@ -43,6 +43,8 @@ describe('checkConnection', () => {
     ['cin', 'original'],
     ['img', 'reference'],
     ['t', 'theme'],
+    ['img', 'original'],
+    ['out', 'theme'],
     ['pal1', 'palette'],
   ])('accepts %s → generate.%s', (source, handle) => {
     expect(checkConnection(conn(source, 'g', handle), nodes, []).ok).toBe(true);
@@ -55,8 +57,8 @@ describe('checkConnection', () => {
 
   it.each([
     ['p', 'original'],
-    ['t', 'reference'],
-    ['img', 'theme'],
+    ['p', 'theme'],
+    ['cin', 'reference'],
     ['o', 'palette'],
   ])('rejects mismatched type %s → generate.%s', (source, handle) => {
     const res = checkConnection(conn(source, 'g', handle), nodes, []);
@@ -72,11 +74,14 @@ describe('checkConnection', () => {
     expect(checkConnection(conn('g', 'cin', 'in'), nodes, []).ok).toBe(false);
   });
 
-  it('allows only one palette per generate node', () => {
+  it('a one-connection port takes the new connection and reports the old one as replaced', () => {
     const edges = [edge('pal1', 'g', 'palette')];
     const res = checkConnection(conn('pal2', 'g', 'palette'), nodes, edges);
-    expect(res.ok).toBe(false);
-    expect(res.reason).toMatch(/only one/);
+    expect(res.ok).toBe(true);
+    expect(res.replaces).toEqual([edges[0].id]);
+    // Nothing to replace on an empty port, and multi-connection ports never replace.
+    expect(checkConnection(conn('pal2', 'g', 'palette'), nodes, []).replaces).toBeUndefined();
+    expect(checkConnection(conn('cin', 'g', 'original'), nodes, [edge('o', 'g', 'original')]).replaces).toBeUndefined();
   });
 
   it('allows multiple prompts and originals', () => {

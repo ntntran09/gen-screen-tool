@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import shutil
 import sqlite3
 import uuid
 import warnings
@@ -185,7 +186,8 @@ def _row_to_dict(row: sqlite3.Row, settings: Settings) -> dict[str, Any]:
         "sha256": row["sha256"],
         "origin": row["origin"],
         "created_at": row["created_at"],
-        "missing": not (pdir / row["relative_path"]).is_file(),
+        "deleted": row["deleted_at"] is not None,
+        "missing": row["deleted_at"] is not None or not (pdir / row["relative_path"]).is_file(),
     }
 
 
@@ -204,12 +206,19 @@ def get_asset(conn: sqlite3.Connection, settings: Settings, asset_id: str) -> di
     return _row_to_dict(get_asset_row(conn, asset_id), settings)
 
 
-def list_assets(conn: sqlite3.Connection, settings: Settings, project_id: str) -> list[dict[str, Any]]:
-    rows = conn.execute("SELECT * FROM assets WHERE project_id = ? ORDER BY created_at, rowid", (project_id,))
+def list_assets(
+    conn: sqlite3.Connection, settings: Settings, project_id: str, *, include_deleted: bool = False
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM assets WHERE project_id = ? AND (? OR deleted_at IS NULL) ORDER BY created_at, rowid",
+        (project_id, include_deleted),
+    )
     return [_row_to_dict(r, settings) for r in rows]
 
 
 def asset_file(settings: Settings, row: sqlite3.Row, *, thumbnail: bool = False) -> Path:
+    if row["deleted_at"] is not None:
+        raise AssetError("ASSET_MISSING", "This image was deleted from the library.", status=404)
     rel = row["thumbnail_path"] if thumbnail else row["relative_path"]
     pdir = project_dir(settings, row["project_id"]).resolve()
     path = (pdir / rel).resolve() if rel else None
@@ -223,3 +232,130 @@ def rename_asset(conn: sqlite3.Connection, settings: Settings, asset_id: str, na
     with transaction(conn):
         conn.execute("UPDATE assets SET display_name = ? WHERE id = ?", (sanitize_display_name(name), asset_id))
     return get_asset(conn, settings, asset_id)
+
+
+def delete_assets(conn: sqlite3.Connection, settings: Settings, project_id: str, asset_ids: list[str]) -> list[str]:
+    """Hide assets from the library and move their files to backups (recoverable, never erased).
+
+    The rows stay so generation history and old snapshots still resolve; they read as missing.
+    """
+    ids = []
+    for asset_id in dict.fromkeys(asset_ids):
+        row = get_asset_row(conn, asset_id)
+        if row["project_id"] != project_id:
+            raise AssetError("NOT_FOUND", "Asset not found in this project.", status=404)
+        if row["deleted_at"] is None:
+            ids.append(row)
+    with transaction(conn):
+        conn.executemany("UPDATE assets SET deleted_at = ? WHERE id = ?", [(now_iso(), r["id"]) for r in ids])
+    pdir = project_dir(settings, project_id).resolve()
+    trash = settings.workspace_dir / "backups" / "deleted-assets" / str(uuid.UUID(project_id))
+    for r in ids:
+        for rel in (r["relative_path"], r["thumbnail_path"]):
+            src = (pdir / rel).resolve() if rel else None
+            if src is None or not src.is_relative_to(pdir) or not src.is_file():
+                continue
+            dest = trash / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(src, dest)
+    return [r["id"] for r in ids]
+
+
+# Palette extraction tuning (RGB distances are 0..441).
+_PALETTE_SIZE = 128  # work on a small copy
+_BG_TOLERANCE = 34  # how close to the background colour a pixel must be to count as background
+_MIN_DISTINCT = 46  # chosen colours must differ by at least this much
+_FINE_COLORS = 32  # quantise finely first, then pick the distinct main colours from those
+
+
+def _dist(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+
+def _background_mask(rgb: list[tuple[int, int, int]], opaque: list[bool], w: int, h: int) -> list[bool] | None:
+    """Pixels of a plain backdrop connected to the image border, or None when there is no such backdrop.
+
+    Generated game assets usually sit on solid white; left in, it would take most of the palette.
+    Only the region touching the border is removed, so white parts of the subject itself stay.
+    """
+    border = [i for i in range(w * h) if opaque[i] and (i % w in (0, w - 1) or i // w in (0, h - 1))]
+    if not border:
+        return None
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    for i in border:
+        r, g, b = rgb[i]
+        buckets.setdefault((r // 32, g // 32, b // 32), []).append(i)
+    members = max(buckets.values(), key=len)
+    bg = tuple(sum(rgb[i][c] for i in members) // len(members) for c in range(3))
+    near = [i for i in border if _dist(rgb[i], bg) <= _BG_TOLERANCE]  # type: ignore[arg-type]
+    if len(near) < 0.9 * len(border):  # a real backdrop is nearly the whole border; a subject touching it is not
+        return None
+    mask = [False] * (w * h)
+    stack = list(near)
+    for i in stack:
+        mask[i] = True
+    while stack:
+        i = stack.pop()
+        x, y = i % w, i // w
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < w and 0 <= ny < h:
+                j = ny * w + nx
+                if not mask[j] and opaque[j] and _dist(rgb[j], bg) <= _BG_TOLERANCE:  # type: ignore[arg-type]
+                    mask[j] = True
+                    stack.append(j)
+    return mask
+
+
+def _saturation(c: tuple[int, int, int]) -> float:
+    hi, lo = max(c), min(c)
+    return 0.0 if hi == 0 else (hi - lo) / hi
+
+
+def extract_palette(conn: sqlite3.Connection, settings: Settings, asset_id: str, count: int = 5) -> list[dict[str, Any]]:
+    """The main, clearly different colours of an image, largest area first.
+
+    Transparent pixels and a plain backdrop touching the border are ignored. Colours are first
+    quantised finely, then the palette is picked greedily (area, with a bonus for saturated colours)
+    skipping any colour too close to one already chosen, so five picks are five distinct colours
+    rather than five shades of the same one. `share` is the area of everything closest to that pick.
+    """
+    row = get_asset_row(conn, asset_id)
+    path = asset_file(settings, row)
+    try:
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img).convert("RGBA")
+            img.thumbnail((_PALETTE_SIZE, _PALETTE_SIZE), Image.Resampling.LANCZOS)
+    except Exception:  # noqa: BLE001
+        raise AssetError("INVALID_INPUT", "The image could not be read.") from None
+    w, h = img.size
+    data = list(img.getdata())
+    rgb = [p[:3] for p in data]
+    opaque = [p[3] >= 128 for p in data]
+    if not any(opaque):
+        raise AssetError("INVALID_INPUT", "The image is fully transparent.")
+    keep = list(opaque)
+    background = _background_mask(rgb, opaque, w, h)
+    if background is not None:
+        without = [k and not b for k, b in zip(keep, background, strict=True)]
+        if sum(without) >= 0.03 * len(keep):  # keep the backdrop if nothing else is left
+            keep = without
+    pixels = [c for c, k in zip(rgb, keep, strict=True) if k]
+    sample = Image.new("RGB", (len(pixels), 1))
+    sample.putdata(pixels)
+    quant = sample.quantize(colors=_FINE_COLORS, method=Image.Quantize.MEDIANCUT)
+    palette = quant.getpalette() or []
+    fine = [(n, (palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2])) for n, i in (quant.getcolors() or [])]
+
+    chosen: list[tuple[int, int, int]] = []
+    for _, c in sorted(fine, key=lambda t: t[0] * (1 + 1.5 * _saturation(t[1])), reverse=True):
+        if len(chosen) >= max(1, min(count, 12)):
+            break
+        if all(_dist(c, o) >= _MIN_DISTINCT for o in chosen):
+            chosen.append(c)
+
+    area = [0] * len(chosen)
+    for n, c in fine:
+        area[min(range(len(chosen)), key=lambda k: _dist(c, chosen[k]))] += n
+    total = sum(area) or 1
+    ranked = sorted(zip(area, chosen, strict=True), reverse=True)
+    return [{"hex": "#{:02X}{:02X}{:02X}".format(*c), "share": round(100 * n / total)} for n, c in ranked]

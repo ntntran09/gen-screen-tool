@@ -1,3 +1,4 @@
+import { NodeIcon } from './NodeIcon';
 import { useReactFlow } from '@xyflow/react';
 import { useState, type DragEvent } from 'react';
 import { ADDABLE_KINDS, getDefinition } from '../graph/registry';
@@ -13,7 +14,7 @@ type Tab = 'nodes' | 'library' | 'projects';
 const NODE_GROUPS: { id: string; label: string; kinds: NodeKind[] }[] = [
   { id: 'all', label: 'All', kinds: ADDABLE_KINDS },
   { id: 'inputs', label: 'Inputs', kinds: ['prompt', 'palette'] },
-  { id: 'images', label: 'Images', kinds: ['image', 'original', 'theme', 'collection'] },
+  { id: 'images', label: 'Images', kinds: ['image', 'collection'] },
   { id: 'ai', label: 'AI', kinds: ['generate'] },
 ];
 
@@ -22,10 +23,12 @@ export function Sidebar({
   projects,
   onOpenProject,
   onNewProject,
+  onDeleteProject,
 }: {
   projects: ProjectSummary[];
   onOpenProject: (id: string) => void;
   onNewProject: () => void;
+  onDeleteProject: (id: string) => void;
 }) {
   const [tab, setTab] = useState<Tab>('nodes');
   const [group, setGroup] = useState('all');
@@ -107,15 +110,15 @@ export function Sidebar({
                       style={{ background: `color-mix(in srgb, ${def.color} 16%, white)` }}
                     >
                       {def.inputs.length > 0 && kind !== 'collection' && (
-                        <span className="absolute -left-[6px] top-1/2 size-2.5 -translate-y-1/2 rounded-full border-2 border-outline bg-node" aria-hidden />
+                        <span className="absolute -left-[7px] top-1/2 size-3.5 -translate-y-1/2 rounded-full border-2 border-outline bg-node" aria-hidden />
                       )}
-                      <span className="size-2.5 shrink-0 rounded-full border-2 border-outline" style={{ background: def.color }} aria-hidden />
+                      <NodeIcon kind={kind} />
                       <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-ink">{def.label}</span>
                       <span className="text-[10px] text-ink-2" aria-hidden>
                         ▸
                       </span>
                       {def.outputs.length > 0 && (
-                        <span className="absolute -right-[6px] top-1/2 size-2.5 -translate-y-1/2 rounded-full border-2 border-outline bg-node" aria-hidden />
+                        <span className="absolute -right-[7px] top-1/2 size-3.5 -translate-y-1/2 rounded-full border-2 border-outline bg-node" aria-hidden />
                       )}
                     </button>
                   </li>
@@ -139,18 +142,28 @@ export function Sidebar({
             </button>
             <ul className="space-y-0.5">
               {projects.map((p) => (
-                <li key={p.id}>
-                  <button
-                    type="button"
-                    onClick={() => onOpenProject(p.id)}
-                    className={`w-full rounded-md px-2 py-1.5 text-left ${
-                      p.id === currentId ? 'bg-panel-2 text-ink' : 'text-ink-2 hover:bg-panel-2'
-                    }`}
-                  >
+                <li
+                  key={p.id}
+                  className={`group flex items-center rounded-md ${
+                    p.id === currentId ? 'bg-panel-2 text-ink' : 'text-ink-2 hover:bg-panel-2'
+                  }`}
+                >
+                  <button type="button" onClick={() => onOpenProject(p.id)} className="min-w-0 flex-1 px-2 py-1.5 text-left">
                     <span className="block truncate text-[12px]">{p.name}</span>
                     <span className="block text-[10px] text-ink-3">
                       {new Date(p.updated_at).toLocaleString()}
                     </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onDeleteProject(p.id)}
+                    title={`Delete "${p.name}"`}
+                    aria-label={`Delete project ${p.name}`}
+                    className="mr-1 rounded p-1 text-ink-3 opacity-0 hover:bg-danger-soft hover:text-danger focus:opacity-100 group-hover:opacity-100"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6" />
+                    </svg>
                   </button>
                 </li>
               ))}

@@ -1,16 +1,14 @@
 import type { Edge, Node } from '@xyflow/react';
 
-export type NodeKind =
-  | 'prompt'
-  | 'image'
-  | 'original'
-  | 'theme'
-  | 'palette'
-  | 'collection'
-  | 'generate'
-  | 'output';
+export type NodeKind = 'prompt' | 'image' | 'palette' | 'collection' | 'generate' | 'output';
 
-/** Value types that flow along edges (spec §25.1). */
+/** Older saved projects had separate Original / Theme image nodes; they load as `image`. */
+export const LEGACY_IMAGE_KINDS = ['original', 'theme'] as const;
+
+/**
+ * Value types that flow along edges (spec §25.1). `original` and `theme` are only port
+ * colours now: every image node outputs `image`, and its role comes from the port it feeds.
+ */
 export type PortType = 'prompt' | 'image' | 'original' | 'theme' | 'palette' | 'assetList' | 'generated';
 
 export interface BaseNodeData {
@@ -20,19 +18,30 @@ export interface BaseNodeData {
   [key: string]: unknown;
 }
 
+/** Game-asset settings travel with the prompt (the first prompt feeding a Generate node decides). */
+export const GAME_ASSET_KEYS = [
+  'assetCategory',
+  'artStyle',
+  'preserveSubject',
+  'preserveSilhouette',
+  'consistentFraming',
+  'consistentScale',
+] as const;
+
 export interface PromptData extends BaseNodeData {
   text: string;
   constraints: string;
   enabled: boolean;
   role: 'main' | 'style' | 'constraints' | 'output';
   order: number;
+  assetCategory: (typeof ASSET_CATEGORIES)[number];
+  artStyle: string;
+  preserveSubject: boolean;
+  preserveSilhouette: boolean;
+  consistentFraming: boolean;
+  consistentScale: boolean;
 }
 
-export interface ImageData extends BaseNodeData {
-  /** Set once the asset system (Phase 2) stores the file. */
-  assetId: string | null;
-  notes: string;
-}
 
 export const PRESERVATION_OPTIONS = [
   'composition',
@@ -44,15 +53,20 @@ export const PRESERVATION_OPTIONS = [
 ] as const;
 export type Preservation = (typeof PRESERVATION_OPTIONS)[number];
 
-export interface OriginalData extends ImageData {
-  preserve: Record<Preservation, boolean>;
-  instructions: string;
-}
-
 export const THEME_ROLES = ['artStyle', 'lighting', 'shading', 'material', 'mood', 'composition', 'texture'] as const;
 export type ThemeRole = (typeof THEME_ROLES)[number];
 
-export interface ThemeData extends ImageData {
+/**
+ * One image. What it is used as (original, theme or reference) is decided by the Generate
+ * port it connects to, so it carries the settings for every role.
+ */
+export interface ImageData extends BaseNodeData {
+  assetId: string | null;
+  notes: string;
+  /** Used when connected to an Original port. */
+  preserve: Record<Preservation, boolean>;
+  instructions: string;
+  /** Used when connected to a Theme port. */
   roles: ThemeRole[];
 }
 
@@ -68,6 +82,8 @@ export interface PaletteColor {
 
 export interface PaletteData extends BaseNodeData {
   colors: PaletteColor[];
+  /** How many colours to take when extracting from a connected image. */
+  extractCount: number;
 }
 
 /** One image in a collection. Items reference assets by id; files are never copied. */
@@ -86,10 +102,19 @@ export interface CollectionData extends BaseNodeData {
   description: string;
   /** Ordered items; stored in the graph so undo, copy/paste and auto-save cover them. */
   items: CollectionItem[];
+  /** Output collections: generation batches whose results land here. */
+  batchIds: string[];
+  /** Output collections: tasks already added, so a removed result is not added back on re-sync. */
+  syncedTaskIds: string[];
 }
 
-export const ASPECT_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9'] as const;
+/** `match` = closest preset to the original image's shape (resolved per task by the backend). */
+export const ASPECT_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9', 'match'] as const;
+export const aspectLabel = (a: string) => (a === 'match' ? 'Match original' : a);
+/** A whole game screen, re-themed with the same gameplay and layout. */
+export const GAME_SCREEN = 'Game Screen';
 export const ASSET_CATEGORIES = [
+  'Game Screen',
   'Character',
   'Environment',
   'Prop',
@@ -113,26 +138,21 @@ export interface GenerateData extends BaseNodeData {
   outputFormat: 'png' | 'webp' | 'jpg';
   background: 'white' | 'solid' | 'transparent' | 'custom';
   backgroundValue: string;
-  assetCategory: (typeof ASSET_CATEGORIES)[number];
-  artStyle: string;
-  preserveSubject: boolean;
-  preserveSilhouette: boolean;
-  consistentFraming: boolean;
-  consistentScale: boolean;
   /** Required in Manual Count mode when several originals are connected (spec §12.1 A3). */
   primaryOriginalNodeId: string | null;
 }
 
 export interface OutputData extends BaseNodeData {
   assetId: string | null;
+  /** Batch that produced (or will produce) this result. */
   generationId: string | null;
+  /** Task whose output was placed here. */
+  taskId: string | null;
 }
 
 export interface NodeDataByKind {
   prompt: PromptData;
   image: ImageData;
-  original: OriginalData;
-  theme: ThemeData;
   palette: PaletteData;
   collection: CollectionData;
   generate: GenerateData;

@@ -1,3 +1,4 @@
+import { NodeIcon } from './NodeIcon';
 import { useEffect, useRef } from 'react';
 import { ADDABLE_KINDS, getDefinition } from '../graph/registry';
 import type { NodeKind } from '../graph/types';
@@ -48,7 +49,7 @@ export function AddNodeMenu({
             className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-ink-2 outline-none hover:bg-panel-2 hover:text-ink focus:bg-panel-2 focus:text-ink"
             onClick={() => onPick(kind)}
           >
-            <span className="size-2.5 rounded-full border-2 border-outline" style={{ background: def.color }} aria-hidden />
+            <NodeIcon kind={kind} size={14} />
             {def.label}
           </button>
         );

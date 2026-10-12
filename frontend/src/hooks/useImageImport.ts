@@ -35,7 +35,7 @@ type PlacedAsset = Pick<AssetInfo, 'id' | 'name'>;
 
 /**
  * Put already-stored assets on the canvas: into a node, into a collection,
- * as one new collection, or as separate Reference image nodes (spec §6.4, §22.2).
+ * as one new collection, or as separate Image nodes (spec §6.4, §22.2).
  * Returns a short description of what happened.
  */
 export function useAssetPlacement() {

@@ -2,7 +2,8 @@ import { Handle, Position, useNodeConnections, type NodeProps } from '@xyflow/re
 import { memo, type ReactNode } from 'react';
 import { getDefinition, type InputPort, type OutputPort } from '../graph/registry';
 import type { CanvasNode, PortType } from '../graph/types';
-import { useGraphStore } from '../store/graphStore';
+import { NodeIcon } from '../components/NodeIcon';
+import { isNodeFrozen, useGraphStore } from '../store/graphStore';
 
 const portColor = (type: PortType) => `var(--color-port-${type})`;
 
@@ -42,7 +43,7 @@ function InputRow({ port }: { port: InputPort }) {
       <PortHandle
         type="target"
         id={port.id}
-        portType={port.accepts[0]}
+        portType={port.color ?? port.accepts[0]}
         title={`${port.label}${port.multiple ? ' (multiple)' : ' (one)'}`}
       />
       {port.label}
@@ -73,6 +74,7 @@ interface ShellProps {
 export const NodeShell = memo(function NodeShell({ node, hiddenInputs = [], badge, children, width = 240 }: ShellProps) {
   const def = getDefinition(node.type);
   const { title, collapsed, locked } = node.data;
+  const frozen = useGraphStore((s) => s.frozenCount > 0 && isNodeFrozen(node.id));
   const updateNodeData = useGraphStore((s) => s.updateNodeData);
   const inputs = def.inputs.filter((p) => !hiddenInputs.includes(p.id));
   // Source-only nodes (prompt, images, palette, input collection) put their single
@@ -84,8 +86,9 @@ export const NodeShell = memo(function NodeShell({ node, hiddenInputs = [], badg
   return (
     <div
       className={`rounded-[14px] border-2 bg-node ${
-        node.selected ? 'border-accent ring-4 ring-accent/20' : 'border-outline'
-      }`}
+        node.selected ? 'border-accent ring-4 ring-accent/20' : frozen ? 'border-accent' : 'border-outline'
+      } ${frozen ? 'cursor-not-allowed' : ''}`}
+      title={frozen ? 'Frozen while generating' : undefined}
       style={{ width }}
     >
       <div
@@ -94,19 +97,26 @@ export const NodeShell = memo(function NodeShell({ node, hiddenInputs = [], badg
         }`}
         style={{ background: `color-mix(in srgb, ${def.color} 16%, white)` }}
       >
-        <span className="size-2.5 shrink-0 rounded-full border-2 border-outline" style={{ background: def.color }} aria-hidden />
+        <NodeIcon kind={node.type} size={15} />
         <span className="min-w-0 flex-1 truncate font-semibold text-ink" title={title}>
           {title}
         </span>
         {badge}
-        {locked && (
-          <span className="text-[10px] uppercase tracking-wide text-ink-3" title="Locked">
-            Locked
+        {frozen ? (
+          <span className="text-[10px] uppercase tracking-wide text-accent" title="Frozen while generating">
+            Generating
           </span>
+        ) : (
+          locked && (
+            <span className="text-[10px] uppercase tracking-wide text-ink-3" title="Locked">
+              Locked
+            </span>
+          )
         )}
         <button
           type="button"
-          className="nodrag rounded px-1 text-ink-2 hover:bg-white/60 hover:text-ink"
+          className="nodrag rounded px-1 text-ink-2 hover:bg-white/60 hover:text-ink disabled:opacity-40"
+          disabled={frozen}
           onClick={() => updateNodeData(node.id, { collapsed: !collapsed })}
           aria-label={collapsed ? 'Expand node' : 'Collapse node'}
           title={collapsed ? 'Expand' : 'Collapse'}

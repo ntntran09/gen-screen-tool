@@ -112,6 +112,30 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX idx_assets_project ON assets(project_id);
         """,
     ),
+    (
+        3,
+        # Phase 3 generation: a task "slot" is one expected output; retries add attempts to the same slot.
+        """
+        ALTER TABLE generation_batches ADD COLUMN provider_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE generation_batches ADD COLUMN name TEXT NOT NULL DEFAULT '';
+        ALTER TABLE generation_batches ADD COLUMN cancelled_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE generation_batches ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE generation_batches ADD COLUMN status_reason TEXT;
+        ALTER TABLE generation_tasks ADD COLUMN slot_index INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE generation_tasks ADD COLUMN source_name TEXT;
+        ALTER TABLE generation_tasks ADD COLUMN result_json TEXT;
+        ALTER TABLE generation_tasks ADD COLUMN started_at TEXT;
+        CREATE INDEX idx_batches_project ON generation_batches(project_id, created_at);
+        CREATE INDEX idx_tasks_batch ON generation_tasks(batch_id, slot_index, attempt_number);
+        """,
+    ),
+    (
+        4,
+        # Deleted assets keep their row (generation history points at them); files move to backups.
+        """
+        ALTER TABLE assets ADD COLUMN deleted_at TEXT;
+        """,
+    ),
 ]
 
 

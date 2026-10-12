@@ -62,6 +62,10 @@ export function useShortcuts(saveNow: () => void) {
       } else if (!mod && e.shiftKey && key === '2') {
         const selected = s.nodes.filter((n) => n.selected);
         if (selected.length) void fitView({ nodes: selected, padding: 0.3, duration: 200 });
+      } else if (!mod && !e.shiftKey && !e.altKey && (key === 'v' || key === 'h' || key === 'e')) {
+        s.setTool(key === 'v' ? 'select' : key === 'h' ? 'pan' : 'eraser');
+      } else if (!mod && e.key === 'Escape' && s.tool !== 'select') {
+        s.setTool('select');
       } else if (!mod && (e.key === '+' || e.key === '=')) {
         void zoomIn({ duration: 150 });
       } else if (!mod && e.key === '-') {

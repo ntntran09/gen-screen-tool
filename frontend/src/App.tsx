@@ -4,6 +4,7 @@ import { Canvas } from './components/Canvas';
 import { CollectionViewer } from './components/CollectionViewer';
 import { Inspector } from './components/Inspector';
 import { Lightbox } from './components/Lightbox';
+import { PreviewRequestDialog } from './components/PreviewRequestDialog';
 import { Sidebar } from './components/Sidebar';
 import { StatusPanel, ToastHost } from './components/StatusPanel';
 import { Toolbar } from './components/Toolbar';
@@ -11,6 +12,7 @@ import { useAutosave } from './hooks/useAutosave';
 import { useShortcuts } from './hooks/useShortcuts';
 import { api, type ProjectSummary } from './lib/api';
 import { useAssetStore } from './store/assetStore';
+import { useGenerationStore } from './store/generationStore';
 import { useGraphStore } from './store/graphStore';
 
 const LAST_PROJECT_KEY = 'nodecanvas:lastProjectId';
@@ -51,6 +53,7 @@ function Workspace() {
       loadProject(project);
       rememberProject(project.id);
       await useAssetStore.getState().load(project.id);
+      void useGenerationStore.getState().load(project.id);
     },
     [save, loadProject],
   );
@@ -60,6 +63,7 @@ function Workspace() {
     const project = await api.createProject('Untitled Project');
     loadProject(project);
     void useAssetStore.getState().load(project.id);
+    void useGenerationStore.getState().load(project.id);
     rememberProject(project.id);
     await refreshProjects();
   }, [save, loadProject, refreshProjects]);
@@ -81,6 +85,24 @@ function Workspace() {
       }
     })();
   }, [refreshProjects, openProject, newProject]);
+
+  const deleteProject = useCallback(
+    async (id: string) => {
+      const project = projects.find((p) => p.id === id);
+      const name = project?.name ?? 'this project';
+      if (!window.confirm(`Delete "${name}"?\n\nIts files are moved to the workspace backups folder, not erased.`)) return;
+      const current = useGraphStore.getState().projectId === id;
+      await api.deleteProject(id);
+      const list = await refreshProjects();
+      useGraphStore.getState().showToast(`Deleted "${name}".`);
+      if (current) {
+        // Keep working somewhere: open the most recent project, or start a fresh one.
+        if (list[0]) await openProject(list[0].id);
+        else await newProject();
+      }
+    },
+    [projects, refreshProjects, openProject, newProject],
+  );
 
   const rename = useCallback(
     async (name: string) => {
@@ -117,6 +139,7 @@ function Workspace() {
           projects={projects}
           onOpenProject={(id) => void openProject(id).catch((e: Error) => useGraphStore.getState().showToast(e.message, 'error'))}
           onNewProject={() => void newProject().catch((e: Error) => useGraphStore.getState().showToast(e.message, 'error'))}
+          onDeleteProject={(id) => void deleteProject(id).catch((e: Error) => useGraphStore.getState().showToast(e.message, 'error'))}
         />
         <main className="min-w-0 flex-1">
           <Canvas />
@@ -128,6 +151,7 @@ function Workspace() {
       <StatusPanel />
       <ToastHost />
       <CollectionViewer />
+      <PreviewRequestDialog />
       <Lightbox />
     </div>
   );

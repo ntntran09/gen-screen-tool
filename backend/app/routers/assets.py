@@ -117,6 +117,30 @@ def download(asset_id: str, conn: Conn, settings: Cfg) -> FileResponse:
     return _file_response(conn, settings, asset_id, thumbnail=False, download=True)
 
 
+class AssetDelete(BaseModel):
+    asset_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+@router.post("/api/projects/{project_id}/assets/delete")
+def delete_assets(project_id: str, body: AssetDelete, conn: Conn, settings: Cfg) -> dict[str, Any]:
+    _require_project(conn, project_id)
+    try:
+        return {"deleted": svc.delete_assets(conn, settings, project_id, body.asset_ids)}
+    except svc.AssetError as exc:
+        _raise(exc)
+        raise
+
+
+@router.get("/api/assets/{asset_id}/palette")
+def asset_palette(asset_id: str, conn: Conn, settings: Cfg, count: int = 5) -> dict[str, Any]:
+    """Dominant colours of an image (used by the Color Palette node's "Extract from image")."""
+    try:
+        return {"colors": svc.extract_palette(conn, settings, asset_id, count)}
+    except svc.AssetError as exc:
+        _raise(exc)
+        raise
+
+
 class AssetPatch(BaseModel):
     name: str = Field(min_length=1, max_length=200)
 

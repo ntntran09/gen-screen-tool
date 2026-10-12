@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from ..config import Settings
 from ..credentials import CredentialStore
 from .base import ImageProvider
@@ -20,4 +22,9 @@ class ProviderRegistry:
 
 def build_registry(settings: Settings) -> ProviderRegistry:
     store = CredentialStore(settings.credentials_dir)
-    return ProviderRegistry([CodexProvider(CodexAuth(store, codex_cli_home=settings.codex_cli_home))])
+    providers: list[ImageProvider] = [CodexProvider(CodexAuth(store, codex_cli_home=settings.codex_cli_home))]
+    if os.environ.get("NODECANVAS_FAKE_PROVIDER") == "1":
+        from .fake import FakeProvider
+
+        providers.append(FakeProvider())
+    return ProviderRegistry(providers)

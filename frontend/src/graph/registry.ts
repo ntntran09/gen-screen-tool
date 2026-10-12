@@ -6,6 +6,8 @@ export interface InputPort {
   label: string;
   accepts: PortType[];
   multiple: boolean;
+  /** Colour of the handle when it differs from the first accepted type. */
+  color?: PortType;
 }
 
 export interface OutputPort {
@@ -37,26 +39,30 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
     color: '#4c8df6',
     inputs: [],
     outputs: [{ id: OUT, label: 'Prompt', type: 'prompt' }],
-    defaultData: () => ({ ...base('Prompt'), text: '', constraints: '', enabled: true, role: 'main', order: 0 }),
+    defaultData: () => ({
+      ...base('Prompt'),
+      text: '',
+      constraints: '',
+      enabled: true,
+      role: 'main',
+      order: 0,
+      assetCategory: 'Item',
+      artStyle: '',
+      preserveSubject: true,
+      preserveSilhouette: true,
+      consistentFraming: true,
+      consistentScale: true,
+    }),
   },
   image: {
     kind: 'image',
-    label: 'Reference Image',
-    description: 'General visual reference',
-    color: '#9a948c',
-    inputs: [],
-    outputs: [{ id: OUT, label: 'Image', type: 'image' }],
-    defaultData: () => ({ ...base('Reference Image'), assetId: null, notes: '' }),
-  },
-  original: {
-    kind: 'original',
-    label: 'Original Image',
-    description: 'The subject to transform or edit',
+    label: 'Image',
+    description: 'An image; used as Original, Theme or Reference depending on the port it connects to',
     color: '#ff7a00',
     inputs: [],
-    outputs: [{ id: OUT, label: 'Original', type: 'original' }],
+    outputs: [{ id: OUT, label: 'Image', type: 'image' }],
     defaultData: () => ({
-      ...base('Original Image'),
+      ...base('Image'),
       assetId: null,
       notes: '',
       instructions: '',
@@ -68,26 +74,19 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
         mainSubject: true,
         objectCount: false,
       },
+      roles: ['artStyle'],
     }),
-  },
-  theme: {
-    kind: 'theme',
-    label: 'Theme Image',
-    description: 'Art-style reference shared across assets',
-    color: '#9b6bdf',
-    inputs: [],
-    outputs: [{ id: OUT, label: 'Theme', type: 'theme' }],
-    defaultData: () => ({ ...base('Theme Image'), assetId: null, notes: '', roles: ['artStyle'] }),
   },
   palette: {
     kind: 'palette',
     label: 'Color Palette',
-    description: 'Colours turned into prompt instructions',
+    description: 'Colours turned into prompt instructions; can take them from a connected image',
     color: '#ee979b',
-    inputs: [],
+    inputs: [{ id: 'image', label: 'Image', accepts: ['image'], multiple: false }],
     outputs: [{ id: OUT, label: 'Palette', type: 'palette' }],
     defaultData: () => ({
       ...base('Color Palette'),
+      extractCount: 5,
       colors: [
         { id: nanoid(8), hex: '#F26B6B', role: 'primary', ratio: null },
         { id: nanoid(8), hex: '#FFC93C', role: 'secondary', ratio: null },
@@ -107,6 +106,8 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
       role: 'input',
       description: '',
       items: [],
+      batchIds: [],
+      syncedTaskIds: [],
     }),
   },
   generate: {
@@ -116,9 +117,9 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
     color: '#3dbe6b',
     inputs: [
       { id: 'prompt', label: 'Prompt', accepts: ['prompt'], multiple: true },
-      { id: 'original', label: 'Original', accepts: ['original', 'assetList'], multiple: true },
+      { id: 'original', label: 'Original', accepts: ['image', 'assetList'], multiple: true, color: 'original' },
       { id: 'reference', label: 'Reference', accepts: ['image'], multiple: true },
-      { id: 'theme', label: 'Theme', accepts: ['theme'], multiple: true },
+      { id: 'theme', label: 'Theme', accepts: ['image'], multiple: true, color: 'theme' },
       { id: 'palette', label: 'Palette', accepts: ['palette'], multiple: false },
     ],
     outputs: [{ id: OUT, label: 'Generated', type: 'generated' }],
@@ -134,12 +135,6 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
       outputFormat: 'png',
       background: 'white',
       backgroundValue: '',
-      assetCategory: 'Item',
-      artStyle: '',
-      preserveSubject: true,
-      preserveSilhouette: true,
-      consistentFraming: true,
-      consistentScale: true,
       primaryOriginalNodeId: null,
     }),
   },
@@ -150,7 +145,7 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
     color: '#b8b0a6',
     inputs: [{ id: 'in', label: 'Generated', accepts: ['generated'], multiple: false }],
     outputs: [{ id: OUT, label: 'Image', type: 'image' }],
-    defaultData: () => ({ ...base('Output Image'), assetId: null, generationId: null }),
+    defaultData: () => ({ ...base('Output Image'), assetId: null, generationId: null, taskId: null }),
   },
 };
 

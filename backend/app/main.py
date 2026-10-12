@@ -12,8 +12,9 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from .config import Settings
 from .db import migrate
+from .generation.engine import GenerationEngine
 from .providers import build_registry
-from .routers import assets, auth, projects, providers
+from .routers import assets, auth, generations, projects, providers
 from .security import CSRF_HEADER, LocalGuardMiddleware
 
 
@@ -24,7 +25,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         settings.ensure_dirs()
         migrate(settings.database_path, settings.workspace_dir / "backups")
+        app.state.engine.start()
         yield
+        await app.state.engine.stop()
         for provider in app.state.providers.list():
             auth = getattr(provider, "auth", None)
             if auth is not None:
@@ -33,6 +36,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="NodeCanvas AI", lifespan=lifespan)
     app.state.settings = settings
     app.state.providers = build_registry(settings)
+    # The registry is looked up per task so tests (and future provider settings) can swap it.
+    app.state.engine = GenerationEngine(settings, lambda: app.state.providers)
 
     # The last-added middleware runs first: CORS wraps the guard so preflights get CORS headers.
     app.add_middleware(LocalGuardMiddleware, settings=settings)
@@ -71,6 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(assets.router)
     app.include_router(providers.router)
+    app.include_router(generations.router)
     return app
 
 

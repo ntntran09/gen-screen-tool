@@ -19,6 +19,7 @@ const FILTERS: { id: Filter; label: string }[] = [
 ];
 
 const smallBtn = 'rounded-md border border-line px-2 py-1 text-[11px] text-ink-2 hover:bg-panel-2 hover:text-ink';
+const dangerBtn = 'rounded-md border border-danger/50 px-2 py-1 text-[11px] text-danger hover:bg-danger-soft';
 
 /** Every image stored in the project; drag onto the canvas, a node or a collection (spec Phase 2b). */
 export function AssetLibrary() {
@@ -75,6 +76,25 @@ export function AssetLibrary() {
     e.dataTransfer.effectAllowed = 'copy';
   };
 
+  const remove = async () => {
+    const ids = selectedAssets.map((a) => a.id);
+    const inUse = ids.reduce((n, id) => n + (used.get(id) ?? 0), 0);
+    const what = ids.length === 1 ? `"${selectedAssets[0].name}"` : `${ids.length} images`;
+    const note = inUse
+      ? `\n\n${inUse} place(s) on the canvas use them; those nodes and collection items will be emptied (Ctrl+Z restores the canvas, not the files).`
+      : '';
+    if (!window.confirm(`Delete ${what} from the library?${note}\n\nFiles are moved to the workspace backups folder, not erased.`)) return;
+    const graph = useGraphStore.getState();
+    try {
+      const deleted = await useAssetStore.getState().remove(ids);
+      graph.clearAssetRefs(ids);
+      graph.showToast(`Deleted ${deleted.length} image${deleted.length === 1 ? '' : 's'}.`);
+      setSelected([]);
+    } catch (err) {
+      graph.showToast((err as Error).message, 'error');
+    }
+  };
+
   const place = (group: boolean) => {
     const message = placeAssets(selectedAssets, { group });
     if (message) useGraphStore.getState().showToast(`${message}.`);
@@ -129,6 +149,9 @@ export function AssetLibrary() {
               New collection
             </button>
           )}
+          <button type="button" className={dangerBtn} onClick={() => void remove()}>
+            Delete
+          </button>
           <button type="button" className="ml-auto px-1 text-ink-3 hover:text-ink" onClick={() => setSelected([])} aria-label="Clear selection">
             ×
           </button>

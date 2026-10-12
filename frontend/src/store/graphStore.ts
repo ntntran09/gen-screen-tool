@@ -11,9 +11,22 @@ import { nanoid } from 'nanoid';
 import { create } from 'zustand';
 import { getDefinition, isNodeKind } from '../graph/registry';
 import { collectionItems, makeItems, nodeAssetId, readingOrder } from '../graph/collections';
-import type { AnyNodeData, CanvasEdge, CanvasNode, CollectionItem, NodeKind, OriginalData } from '../graph/types';
+import { attachResults, connectedOutputCollection, type TaskResult } from '../graph/generation';
+import { findFreeSpot } from '../graph/layout';
+import type {
+  AnyNodeData,
+  CanvasEdge,
+  CanvasNode,
+  CollectionData,
+  CollectionItem,
+  NodeKind,
+  ImageData,
+  OutputData,
+  PaletteData,
+} from '../graph/types';
+import { GAME_ASSET_KEYS, LEGACY_IMAGE_KINDS } from '../graph/types';
 import { checkConnection } from '../graph/validation';
-import type { ProjectDetail, Viewport } from '../lib/api';
+import { api, type ProjectDetail, type Viewport } from '../lib/api';
 
 interface Snapshot {
   nodes: CanvasNode[];
@@ -21,6 +34,9 @@ interface Snapshot {
 }
 
 export type SaveStatus = 'saved' | 'dirty' | 'saving' | 'error';
+
+/** Canvas pointer tool: box-select, hand (left-drag pans), or eraser (click/drag deletes). */
+export type CanvasTool = 'select' | 'pan' | 'eraser';
 
 export interface Toast {
   id: number;
@@ -46,15 +62,18 @@ interface GraphState {
   saveStatus: SaveStatus;
   saveError: string | null;
   toast: Toast | null;
-  /** Generate nodes with a run in progress. Transient: never saved or undone. */
-  generatingNodeIds: Record<string, true>;
   lastCommit: { key: string; at: number } | null;
+  /** Transient UI state: never saved or undone. */
+  tool: CanvasTool;
+  setTool: (tool: CanvasTool) => void;
 
   loadProject: (project: ProjectDetail) => void;
   setProjectName: (name: string) => void;
   setSaveStatus: (status: SaveStatus, error?: string | null) => void;
   setViewport: (viewport: Viewport) => void;
-  setGenerating: (nodeId: string, on: boolean) => void;
+  /** Freeze exactly these Generate nodes (a batch is running on them). */
+  setFrozen: (ids: string[]) => void;
+  frozenCount: number;
   showToast: (message: string, tone?: Toast['tone']) => void;
 
   commit: (coalesceKey?: string) => void;
@@ -67,27 +86,60 @@ interface GraphState {
   addNode: (kind: NodeKind, position: XYPosition, data?: Partial<AnyNodeData>) => string;
   /** Add several nodes as one undo step; returns their ids in order. */
   addNodes: (items: { kind: NodeKind; position: XYPosition; data?: Partial<AnyNodeData> }[]) => string[];
-  /** Change an image-like node's role (Reference / Original / Theme), keeping its asset. */
-  convertNode: (id: string, kind: 'image' | 'original' | 'theme') => void;
   updateNodeData: (id: string, patch: Partial<AnyNodeData>) => void;
   /** Replace a collection's items. Pass a coalesce key for typing so one edit is one undo step. */
   setCollectionItems: (id: string, items: CollectionItem[], coalesceKey?: string) => void;
   /** Turn single-image nodes (default: the selection) into one Input Collection. Returns its id. */
   groupIntoCollection: (ids?: string[]) => string | null;
+  /**
+   * Fill a Color Palette from the image connected to its Image port (replaces its colours).
+   * `count` defaults to the node's own setting. Resolves to false when there is nothing to read.
+   */
+  extractPalette: (paletteId: string, count?: number) => Promise<boolean>;
   /** Replace an Input Collection with one Original node per item. */
   ungroupCollection: (id: string) => void;
+  /**
+   * Create (or reuse) the node that receives a new batch's results, connected to the Generate
+   * node: an Output Image for one expected result, an Output Collection for several (spec §16.4).
+   */
+  placeResultNode: (generateId: string, batchId: string, expected: number) => void;
+  /** Clear every node and collection item that shows one of these assets (one undo step). Returns the count. */
+  clearAssetRefs: (assetIds: string[]) => number;
+  /** Undo `placeResultNode` when the batch could not be created (only removes still-empty nodes). */
+  discardResultNode: (batchId: string) => void;
+  /** Fill result nodes from completed tasks. Not an undo step: results come from the backend. */
+  applyResults: (tasks: TaskResult[]) => void;
   deleteSelected: () => void;
+  /**
+   * Delete specific nodes and connections (eraser, context menu). Locked nodes are kept.
+   * Calls sharing a coalesce key (one eraser stroke) undo as one step. Returns how many locked nodes were kept.
+   */
+  eraseItems: (items: { nodeIds?: string[]; edgeIds?: string[] }, coalesceKey?: string) => number;
   duplicateSelected: () => void;
   copySelected: () => void;
   paste: () => void;
   selectAll: () => void;
 }
 
-/** Apply per-node interaction flags derived from data (lock state). */
+/**
+ * Generate nodes with a batch running. They are frozen: not movable, deletable or connectable
+ * until the batch ends. Transient (never saved or undone); kept in step by generationStore.
+ */
+let frozenIds: ReadonlySet<string> = new Set();
+
+/** True while the user must not change this node: locked by them, or frozen by a running batch. */
+export function isNodeLocked(node: Pick<CanvasNode, 'id' | 'data'>): boolean {
+  return Boolean(node.data.locked) || frozenIds.has(node.id);
+}
+
+export const isNodeFrozen = (id: string) => frozenIds.has(id);
+
+/** Apply per-node interaction flags derived from data (lock state) and running batches. */
 function withFlags(node: CanvasNode): CanvasNode {
-  const locked = Boolean(node.data.locked);
-  if (node.draggable === !locked && node.deletable === !locked) return node;
-  return { ...node, draggable: !locked, deletable: !locked };
+  const locked = isNodeLocked(node);
+  const frozen = frozenIds.has(node.id);
+  if (node.draggable === !locked && node.deletable === !locked && node.connectable === !frozen) return node;
+  return { ...node, draggable: !locked, deletable: !locked, connectable: !frozen };
 }
 
 function stripSelection(snapshot: Snapshot): Snapshot {
@@ -109,7 +161,8 @@ function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
       width: n.width,
       height: n.height,
       // Assets are referenced by id, never copied, so a pasted node points at the same file.
-      data: structuredClone(n.data),
+      // A copied Output Collection keeps its images but no longer receives the original's batches.
+      data: n.type === 'collection' ? { ...structuredClone(n.data), batchIds: [] } : structuredClone(n.data),
       selected: true,
     });
   });
@@ -123,6 +176,34 @@ function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
       targetHandle: e.targetHandle,
     }));
   return { nodes, edges };
+}
+
+/** Old projects had separate Original / Theme nodes; both are an Image node now (role = port). */
+function upgradeLegacyNode<T extends { type: string; data: Record<string, unknown> }>(n: T): T {
+  if (!(LEGACY_IMAGE_KINDS as readonly string[]).includes(n.type)) return n;
+  const legacyTitle = n.type === 'original' ? 'Original Image' : 'Theme Image';
+  return { ...n, type: 'image', data: { ...n.data, title: n.data.title === legacyTitle ? 'Image' : n.data.title } };
+}
+
+/**
+ * Game-asset settings used to live on the Generate node. A prompt saved before the move gets
+ * them from the Generate node it feeds, so loading an old project keeps the same results.
+ */
+function moveGameAssetSettings<T extends { id: string; type: string; data: Record<string, unknown> }>(
+  nodes: T[],
+  edges: { source: string; target: string; targetHandle: string | null }[],
+): T[] {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  return nodes.map((n) => {
+    if (n.type !== 'prompt' || 'assetCategory' in n.data) return n;
+    const gen = edges
+      .filter((e) => e.source === n.id && e.targetHandle === 'prompt')
+      .map((e) => byId.get(e.target))
+      .find((g) => g?.type === 'generate' && 'assetCategory' in g.data);
+    if (!gen) return n;
+    const moved = Object.fromEntries(GAME_ASSET_KEYS.filter((k) => k in gen.data).map((k) => [k, gen.data[k]]));
+    return { ...n, data: { ...n.data, ...moved } };
+  });
 }
 
 let toastSeq = 0;
@@ -143,14 +224,16 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     saveStatus: 'saved',
     saveError: null,
     toast: null,
-    generatingNodeIds: {},
     lastCommit: null,
+    tool: 'select',
+    setTool: (tool) => set({ tool }),
 
     loadProject: (project) =>
       set({
         projectId: project.id,
         projectName: project.name,
-        nodes: project.graph.nodes
+        nodes: moveGameAssetSettings(project.graph.nodes, project.graph.edges)
+          .map(upgradeLegacyNode)
           .filter((n) => isNodeKind(n.type))
           .map((n) =>
             withFlags({
@@ -171,10 +254,16 @@ export const useGraphStore = create<GraphState>()((set, get) => {
         saveStatus: 'saved',
         saveError: null,
         lastCommit: null,
-        generatingNodeIds: {},
       }),
 
     setProjectName: (name) => set({ projectName: name }),
+    frozenCount: 0,
+    setFrozen: (ids) => {
+      const next = new Set(ids);
+      if (next.size === frozenIds.size && [...next].every((id) => frozenIds.has(id))) return;
+      frozenIds = next;
+      set((s) => ({ nodes: s.nodes.map(withFlags), frozenCount: next.size }));
+    },
     setSaveStatus: (saveStatus, error = null) => set({ saveStatus, saveError: error }),
     setViewport: (viewport) => {
       const cur = get().viewport;
@@ -182,13 +271,6 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       set({ viewport });
       touch();
     },
-    setGenerating: (nodeId, on) =>
-      set((s) => {
-        const next = { ...s.generatingNodeIds };
-        if (on) next[nodeId] = true;
-        else delete next[nodeId];
-        return { generatingNodeIds: next };
-      }),
     showToast: (message, tone = 'info') => set({ toast: { id: ++toastSeq, message, tone } }),
 
     commit: (coalesceKey) => {
@@ -247,14 +329,54 @@ export const useGraphStore = create<GraphState>()((set, get) => {
 
     connect: (connection) => {
       const { nodes, edges, commit, showToast } = get();
+      if (frozenIds.has(connection.source!) || frozenIds.has(connection.target!)) {
+        showToast('This node is generating. Connections change when it finishes.', 'error');
+        return;
+      }
       const check = checkConnection(connection, nodes, edges);
       if (!check.ok) {
         showToast(check.reason ?? 'Invalid connection.', 'error');
         return;
       }
+      const replaced = edges.filter((e) => check.replaces?.includes(e.id));
+      // The old connection goes away with the new one; not while a node on it is generating.
+      if (replaced.some((e) => frozenIds.has(e.source) || frozenIds.has(e.target))) {
+        showToast('The current connection is in use by a running generation. Try again when it finishes.', 'error');
+        return;
+      }
       commit();
-      set({ edges: addEdge({ ...connection, id: `e-${nanoid(10)}` }, get().edges) });
+      set({
+        edges: addEdge(
+          { ...connection, id: `e-${nanoid(10)}` },
+          edges.filter((e) => !check.replaces?.includes(e.id)),
+        ),
+      });
       touch();
+      if (replaced.length > 0) showToast('Replaced the previous connection.');
+      if (connection.targetHandle === 'image' && nodes.find((n) => n.id === connection.target)?.type === 'palette') {
+        void get().extractPalette(connection.target!);
+      }
+    },
+
+    extractPalette: async (paletteId, count) => {
+      const { nodes, edges, showToast } = get();
+      const palette = nodes.find((n) => n.id === paletteId);
+      const edge = edges.find((e) => e.target === paletteId && e.targetHandle === 'image');
+      const source = edge && nodes.find((n) => n.id === edge.source);
+      const assetId = source ? nodeAssetId(source) : null;
+      if (palette?.type !== 'palette' || !assetId) return false;
+      const n = Math.min(8, Math.max(2, count ?? (palette.data as PaletteData).extractCount ?? 5));
+      try {
+        const { colors } = await api.assetPalette(assetId, n);
+        const roles = ['primary', 'secondary', 'accent'] as const;
+        get().updateNodeData(paletteId, {
+          colors: colors.map((c, i) => ({ id: nanoid(8), hex: c.hex, role: roles[i] ?? 'accent', ratio: c.share })),
+        });
+        return true;
+      } catch (err) {
+        showToast(`Could not read colors from the image: ${(err as Error).message}`, 'error');
+        return false;
+      }
     },
 
     addNode: (kind, position, data) => get().addNodes([{ kind, position, data }])[0],
@@ -276,39 +398,17 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       return created.map((n) => n.id);
     },
 
-    convertNode: (id, kind) => {
-      const { nodes, edges, commit, showToast } = get();
-      const node = nodes.find((n) => n.id === id);
-      if (!node || node.type === kind || !['image', 'original', 'theme', 'output'].includes(node.type!)) return;
-      commit();
-      const oldDef = getDefinition(node.type!);
-      const fresh = getDefinition(kind).defaultData();
-      const old = node.data as Record<string, unknown>;
-      const data = {
-        ...fresh,
-        // Keep a custom title; a default one follows the new role.
-        title: old.title === oldDef.defaultData().title ? fresh.title : old.title,
-        locked: old.locked,
-        collapsed: old.collapsed,
-        assetId: old.assetId ?? null,
-        notes: typeof old.notes === 'string' ? old.notes : '',
-      } as AnyNodeData;
-      const converted = withFlags({ ...node, type: kind, data });
-      const nextNodes = nodes.map((n) => (n.id === id ? converted : n));
-      // The output type changes with the role, so existing connections may no longer fit.
-      const kept = edges.filter(
-        (e) => e.source !== id || checkConnection(e, nextNodes, edges.filter((o) => o.id !== e.id)).ok,
-      );
-      set({ nodes: nextNodes, edges: kept });
-      if (kept.length !== edges.length) showToast(`Removed ${edges.length - kept.length} connection(s) that no longer fit.`);
-      touch();
-    },
-
     updateNodeData: (id, patch) => {
       get().commit(`data:${id}:${Object.keys(patch).sort().join(',')}`);
       set((s) => ({
         nodes: s.nodes.map((n) => (n.id === id ? withFlags({ ...n, data: { ...n.data, ...patch } as AnyNodeData }) : n)),
       }));
+      if ('assetId' in patch) {
+        // A connected image changed: its palette follows it.
+        for (const e of get().edges) {
+          if (e.source === id && e.targetHandle === 'image') void get().extractPalette(e.target);
+        }
+      }
       if ('role' in patch) {
         // A collection switching input↔output changes which connections are legal.
         const { nodes, edges, showToast } = get();
@@ -336,7 +436,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     groupIntoCollection: (ids) => {
       const { nodes, edges, commit, showToast } = get();
       const pool = ids ? nodes.filter((n) => ids.includes(n.id)) : nodes.filter((n) => n.selected);
-      const members = readingOrder(pool.filter((n) => nodeAssetId(n) && !n.data.locked));
+      const members = readingOrder(pool.filter((n) => nodeAssetId(n) && !isNodeLocked(n)));
       if (members.length < 2) {
         showToast('Select at least two unlocked image nodes to group.', 'error');
         return null;
@@ -346,7 +446,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       const items = makeItems(members.map((n) => nodeAssetId(n)!));
       // An Original's own instructions become that item's prompt override.
       members.forEach((n, i) => {
-        if (n.type === 'original') items[i].promptOverride = (n.data as OriginalData).instructions ?? '';
+        if (n.type === 'image') items[i].promptOverride = (n.data as ImageData).instructions ?? '';
       });
       const collection = withFlags({
         id: crypto.randomUUID(),
@@ -387,7 +487,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     ungroupCollection: (id) => {
       const { nodes, edges, commit, showToast } = get();
       const node = nodes.find((n) => n.id === id);
-      if (node?.type !== 'collection' || node.data.locked) return;
+      if (node?.type !== 'collection' || isNodeLocked(node)) return;
       const items = collectionItems(node);
       if ((node.data as { role?: string }).role !== 'input' || items.length === 0) {
         showToast('Only a non-empty Input Collection can be ungrouped.', 'error');
@@ -397,9 +497,9 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       const created = items.map((item, i) =>
         withFlags({
           id: crypto.randomUUID(),
-          type: 'original' as const,
+          type: 'image' as const,
           position: { x: node.position.x + (i % 4) * 230, y: node.position.y + Math.floor(i / 4) * 290 },
-          data: { ...getDefinition('original').defaultData(), assetId: item.assetId, instructions: item.promptOverride } as AnyNodeData,
+          data: { ...getDefinition('image').defaultData(), assetId: item.assetId, instructions: item.promptOverride } as AnyNodeData,
           selected: true,
         }),
       );
@@ -415,14 +515,108 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       }
       set({ nodes: nextNodes, edges: [...kept, ...added] });
       const off = items.filter((i) => !i.enabled).length;
-      showToast(`Ungrouped into ${created.length} Original nodes.${off ? ` ${off} were disabled in the collection.` : ''}`);
+      showToast(`Ungrouped into ${created.length} Image nodes.${off ? ` ${off} were disabled in the collection.` : ''}`);
+      touch();
+    },
+
+    placeResultNode: (generateId, batchId, expected) => {
+      const { nodes, edges, commit } = get();
+      const gen = nodes.find((n) => n.id === generateId);
+      if (!gen) return;
+      commit();
+      const existing = expected > 1 ? connectedOutputCollection(nodes, edges, generateId) : null;
+      if (existing) {
+        const data = existing.data as CollectionData;
+        set({
+          nodes: nodes.map((n) =>
+            n.id === existing.id ? { ...n, data: { ...data, batchIds: [...(data.batchIds ?? []), batchId] } as AnyNodeData } : n,
+          ),
+        });
+        touch();
+        return;
+      }
+      const kind = expected > 1 ? 'collection' : 'output';
+      const fresh = getDefinition(kind).defaultData();
+      const data =
+        kind === 'collection'
+          ? { ...fresh, title: `${gen.data.title} results`, role: 'output', batchIds: [batchId] }
+          : { ...fresh, title: `${gen.data.title} result`, generationId: batchId };
+      const node = withFlags({
+        id: crypto.randomUUID(),
+        type: kind,
+        position: findFreeSpot({ x: gen.position.x + 320, y: gen.position.y }, nodes),
+        data: data as AnyNodeData,
+      });
+      set({
+        nodes: [...nodes, node],
+        edges: [
+          ...edges,
+          { id: `e-${nanoid(10)}`, source: generateId, sourceHandle: 'out', target: node.id, targetHandle: 'in' },
+        ],
+      });
+      touch();
+    },
+
+    clearAssetRefs: (assetIds) => {
+      const gone = new Set(assetIds);
+      const { nodes, commit } = get();
+      let count = 0;
+      const next = nodes.map((n) => {
+        const id = nodeAssetId(n);
+        if (id && gone.has(id)) {
+          count += 1;
+          return { ...n, data: { ...n.data, assetId: null } as AnyNodeData };
+        }
+        const items = collectionItems(n);
+        const kept = items.filter((i) => !gone.has(i.assetId));
+        if (kept.length === items.length) return n;
+        count += items.length - kept.length;
+        return { ...n, data: { ...n.data, items: kept } as AnyNodeData };
+      });
+      if (count === 0) return 0;
+      commit();
+      set({ nodes: next });
+      touch();
+      return count;
+    },
+
+    discardResultNode: (batchId) => {
+      const { nodes, edges } = get();
+      const dropped = new Set(
+        nodes
+          .filter((n) => {
+            const d = n.data as Partial<OutputData & CollectionData>;
+            if (n.type === 'output') return d.generationId === batchId && !d.assetId;
+            return n.type === 'collection' && d.batchIds?.length === 1 && d.batchIds[0] === batchId && !d.items?.length;
+          })
+          .map((n) => n.id),
+      );
+      set({
+        nodes: nodes
+          .filter((n) => !dropped.has(n.id))
+          .map((n) => {
+            const d = n.data as CollectionData;
+            return n.type === 'collection' && d.batchIds?.includes(batchId)
+              ? { ...n, data: { ...d, batchIds: d.batchIds.filter((b) => b !== batchId) } as AnyNodeData }
+              : n;
+          }),
+        edges: edges.filter((e) => !dropped.has(e.target)),
+      });
+      touch();
+    },
+
+    applyResults: (tasks) => {
+      const { nodes } = get();
+      const next = attachResults(nodes, tasks);
+      if (next === nodes) return;
+      set({ nodes: next });
       touch();
     },
 
     deleteSelected: () => {
       const { nodes, edges, commit, showToast } = get();
-      const removable = new Set(nodes.filter((n) => n.selected && !n.data.locked).map((n) => n.id));
-      const lockedSelected = nodes.some((n) => n.selected && n.data.locked);
+      const removable = new Set(nodes.filter((n) => n.selected && !isNodeLocked(n)).map((n) => n.id));
+      const lockedSelected = nodes.some((n) => n.selected && isNodeLocked(n));
       const edgeIds = new Set(edges.filter((e) => e.selected).map((e) => e.id));
       if (removable.size === 0 && edgeIds.size === 0) {
         if (lockedSelected) showToast('Locked nodes cannot be deleted. Unlock them first.');
@@ -435,6 +629,24 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       });
       if (lockedSelected) showToast('Locked nodes were kept.');
       touch();
+    },
+
+    eraseItems: ({ nodeIds = [], edgeIds = [] }, coalesceKey) => {
+      const { nodes, edges, commit } = get();
+      const wanted = new Set(nodeIds);
+      const removable = new Set(nodes.filter((n) => wanted.has(n.id) && !isNodeLocked(n)).map((n) => n.id));
+      const kept = nodes.filter((n) => wanted.has(n.id) && isNodeLocked(n)).length;
+      // A connection into or out of a generating node stays until the batch ends.
+      const edgeSet = new Set(edgeIds.filter((id) => {
+        const e = edges.find((x) => x.id === id);
+        return !e || !(frozenIds.has(e.source) || frozenIds.has(e.target));
+      }));
+      const nextEdges = edges.filter((e) => !edgeSet.has(e.id) && !removable.has(e.source) && !removable.has(e.target));
+      if (removable.size === 0 && nextEdges.length === edges.length) return kept;
+      commit(coalesceKey);
+      set({ nodes: nodes.filter((n) => !removable.has(n.id)), edges: nextEdges });
+      touch();
+      return kept;
     },
 
     copySelected: () => {

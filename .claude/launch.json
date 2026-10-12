@@ -8,6 +8,12 @@
       "port": 8787
     },
     {
+      "name": "backend-fake",
+      "runtimeExecutable": "backend/.venv/Scripts/python.exe",
+      "runtimeArgs": ["-c", "import os, sys, tempfile, uvicorn; ws = os.path.join(tempfile.gettempdir(), 'nodecanvas-fake'); os.environ.update(NODECANVAS_FAKE_PROVIDER='1', NODECANVAS_WORKSPACE=os.path.join(ws, 'NodeCanvasAI'), NODECANVAS_CREDENTIALS_DIR=os.path.join(ws, 'credentials')); sys.path.insert(0, 'backend'); uvicorn.run('app.main:app', host='127.0.0.1', port=8787)"],
+      "port": 8787
+    },
+    {
       "name": "frontend",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "frontend", "run", "dev"],

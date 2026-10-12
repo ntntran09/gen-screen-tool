@@ -169,6 +169,11 @@ def update_project(project_id: str, body: ProjectUpdate, conn: Conn) -> ProjectS
 
 @router.delete("/{project_id}", status_code=204)
 def delete_project(project_id: str, conn: Conn, settings: Cfg) -> Response:
+    busy = conn.execute(
+        "SELECT 1 FROM generation_batches WHERE project_id = ? AND status IN ('queued', 'running')", (project_id,)
+    ).fetchone()
+    if busy:
+        raise ApiError(409, "BATCH_ACTIVE", "A generation is running in this project. Cancel it before deleting.")
     with transaction(conn):
         _get_row(conn, project_id)
         conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))

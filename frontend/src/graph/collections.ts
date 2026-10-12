@@ -2,7 +2,7 @@ import { nanoid } from 'nanoid';
 import type { CanvasNode, CollectionData, CollectionItem, NodeKind } from './types';
 
 /** Node kinds that hold exactly one image and can be grouped into a collection. */
-export const SINGLE_IMAGE_KINDS: readonly NodeKind[] = ['image', 'original', 'theme', 'output'];
+export const SINGLE_IMAGE_KINDS: readonly NodeKind[] = ['image', 'output'];
 
 export function nodeAssetId(node: CanvasNode): string | null {
   if (!SINGLE_IMAGE_KINDS.includes(node.type!)) return null;
