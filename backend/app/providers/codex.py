@@ -8,11 +8,12 @@ and must be confirmed by the Phase 0 test before anything is marked as supported
 from __future__ import annotations
 
 import base64
+import json
 from typing import Any
 
 import httpx
 
-from .base import AuthState, Capabilities, GenerateRequest, GenerateResult, ImageProvider, ProviderError
+from .base import AnalysisResult, AuthState, Capabilities, GenerateRequest, GenerateResult, ImageProvider, ProviderError
 from .codex_auth import CodexAuth
 
 BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -131,6 +132,46 @@ class CodexProvider(ImageProvider):
         await self.auth.access_token(force_refresh=True)
         return await self._headers()
 
+    async def analyze_image(self, image: bytes, prompt: str, *, instructions: str, model: str) -> AnalysisResult:
+        """Ask a small chat model about an image through the Codex Responses endpoint (text only, no drawing).
+
+        Request shape follows community tools (Hermes Agent, the Codex CLI); like the image calls it is
+        undocumented and may change.
+        """
+        data_url = f"data:{sniff_mime(image) or 'image/png'};base64,{base64.b64encode(image).decode()}"
+        body: dict[str, Any] = {
+            "model": model,
+            "store": False,
+            "stream": True,
+            "instructions": instructions,
+            "reasoning": {"effort": "low"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}, {"type": "input_image", "image_url": data_url}],
+                }
+            ],
+        }
+        headers = await self._headers()
+        headers["Accept"] = "text/event-stream"
+        try:
+            async with self._client_factory() as client:
+                for attempt in (0, 1):
+                    async with client.stream("POST", f"{BASE_URL}/responses", json=body, headers=headers) as res:
+                        if res.status_code == 401 and attempt == 0:
+                            headers = {**(await self._headers_after_refresh()), "Accept": "text/event-stream"}
+                            continue
+                        if res.status_code != 200:
+                            await res.aread()
+                            raise self._http_error(res)
+                        return await _read_text_stream(res)
+        except httpx.TimeoutException:
+            raise ProviderError("GENERATION_TIMEOUT", "The image analysis timed out.") from None
+        except httpx.TransportError:
+            raise ProviderError("NETWORK_ERROR", "Network error while contacting ChatGPT.") from None
+        raise ProviderError("AUTH_EXPIRED", "ChatGPT session is no longer valid. Connect again.")
+
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         raw = await self._post(GENERATIONS_URL, self._body(request))
         result = self.normalize_result(raw)
@@ -190,3 +231,54 @@ class CodexProvider(ImageProvider):
         if isinstance(exc, ProviderError):
             return exc
         return ProviderError("UNKNOWN_ERROR", "Unexpected provider error.")
+
+
+async def _read_text_stream(res: httpx.Response) -> AnalysisResult:
+    """Collect the answer text from a Responses server-sent-event stream."""
+    parts: list[str] = []
+    final: str | None = None
+    model: str | None = None
+    event: str | None = None
+    data: list[str] = []
+
+    def handle() -> None:
+        nonlocal final, model
+        raw = "\n".join(data).strip()
+        if not raw or raw == "[DONE]":
+            return
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return
+        kind = payload.get("type") or event
+        if kind == "response.output_text.delta" and isinstance(payload.get("delta"), str):
+            parts.append(payload["delta"])
+        elif kind == "response.output_text.done" and isinstance(payload.get("text"), str):
+            final = payload["text"]
+        elif kind in ("response.failed", "error", "response.incomplete"):
+            err = payload.get("error") or (payload.get("response") or {}).get("error") or {}
+            message = err.get("message") if isinstance(err, dict) else str(err)
+            raise ProviderError("PROVIDER_UNAVAILABLE", (message or "The analysis did not finish.")[:300])
+        elif kind == "response.completed":
+            response = payload.get("response") or {}
+            model = response.get("model") or model
+            if final is None and not parts:
+                for item in response.get("output") or []:
+                    for part in item.get("content") or []:
+                        if isinstance(part.get("text"), str):
+                            parts.append(part["text"])
+
+    async for line in res.aiter_lines():
+        if line == "":
+            handle()
+            event, data = None, []
+        elif line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            data.append(line[5:].lstrip())
+    if data:
+        handle()
+    text = final if final is not None else "".join(parts)
+    if not text.strip():
+        raise ProviderError("EMPTY_RESULT", "The model returned no answer.")
+    return AnalysisResult(text=text, reported_model=model)

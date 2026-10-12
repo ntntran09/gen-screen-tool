@@ -1,6 +1,7 @@
 import { Handle, Position, useNodeConnections, type NodeProps } from '@xyflow/react';
 import { memo, type ReactNode } from 'react';
-import { getDefinition, type InputPort, type OutputPort } from '../graph/registry';
+import { generateNeedsOriginal } from '../graph/generation';
+import { getDefinition, isPortRequired, type InputPort, type OutputPort } from '../graph/registry';
 import type { CanvasNode, PortType } from '../graph/types';
 import { NodeIcon } from '../components/NodeIcon';
 import { isNodeFrozen, useGraphStore } from '../store/graphStore';
@@ -36,17 +37,30 @@ function useConnectionCount(type: 'source' | 'target', id: string) {
   return useNodeConnections({ handleType: type, handleId: id }).length;
 }
 
-function InputRow({ port }: { port: InputPort }) {
+function InputRow({ port, required }: { port: InputPort; required: boolean }) {
   const count = useConnectionCount('target', port.id);
   return (
-    <div className={`relative flex h-6 items-center pl-3 text-[11px] ${count ? 'font-semibold text-ink' : 'text-ink-2'}`}>
+    <div
+      className={`relative flex h-6 items-center pl-3 text-[11px] ${
+        count ? 'font-semibold text-ink' : required ? 'font-semibold text-danger' : 'text-ink-2'
+      }`}
+    >
       <PortHandle
         type="target"
         id={port.id}
         portType={port.color ?? port.accepts[0]}
-        title={`${port.label}${port.multiple ? ' (multiple)' : ' (one)'}`}
+        title={`${port.label}${required ? ', required' : ', optional'}${port.multiple ? ', several allowed' : ', one only'}`}
       />
       {port.label}
+      {required && (
+        <span
+          className={`ml-0.5 text-[14px] font-bold leading-none ${count ? 'text-success' : 'text-danger'}`}
+          title={count ? 'Required: connected' : 'Required: connect something here to run'}
+          aria-label={count ? 'required, connected' : 'required, not connected'}
+        >
+          *
+        </span>
+      )}
       {port.multiple && <span className="ml-1 font-normal text-ink-3">{count > 1 ? `×${count}` : '+'}</span>}
     </div>
   );
@@ -75,6 +89,7 @@ export const NodeShell = memo(function NodeShell({ node, hiddenInputs = [], badg
   const def = getDefinition(node.type);
   const { title, collapsed, locked } = node.data;
   const frozen = useGraphStore((s) => s.frozenCount > 0 && isNodeFrozen(node.id));
+  const needsOriginal = useGraphStore((s) => node.type === 'generate' && generateNeedsOriginal(s.nodes, s.edges, node.id));
   const updateNodeData = useGraphStore((s) => s.updateNodeData);
   const inputs = def.inputs.filter((p) => !hiddenInputs.includes(p.id));
   // Source-only nodes (prompt, images, palette, input collection) put their single
@@ -130,7 +145,7 @@ export const NodeShell = memo(function NodeShell({ node, hiddenInputs = [], badg
 
       {showPortRows && (
         <div className="flex justify-between py-1">
-          <div>{inputs.map((p) => <InputRow key={p.id} port={p} />)}</div>
+          <div>{inputs.map((p) => <InputRow key={p.id} port={p} required={isPortRequired(p, node.data, { needsOriginal })} />)}</div>
           <div>{def.outputs.map((p) => <OutputRow key={p.id} port={p} />)}</div>
         </div>
       )}

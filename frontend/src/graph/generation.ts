@@ -1,5 +1,5 @@
 import { collectionItems } from './collections';
-import type { CanvasEdge, CanvasNode, CollectionData, CollectionItem, GenerateData, OutputData } from './types';
+import { GAME_SCREEN, type CanvasEdge, type CanvasNode, type CollectionData, type CollectionItem, type GenerateData, type OutputData } from './types';
 
 /** The subset of a backend task needed to place its result on the canvas. */
 export interface TaskResult {
@@ -27,6 +27,66 @@ export function estimateTasks(nodes: CanvasNode[], edges: CanvasEdge[], generate
     else if (src?.type === 'collection') originals += collectionItems(src).filter((i) => i.enabled).length;
   }
   return originals * data.variantsPerInput;
+}
+
+export type OriginalRole =
+  /** Used for every result (Match inputs, or the only original). */
+  | 'used'
+  /** The chosen Primary original (Manual count with several originals). */
+  | 'primary'
+  /** Also sent, as an additional original: another original is the primary. */
+  | 'secondary'
+  /** Several originals and none chosen yet: the user must pick one. */
+  | 'candidate';
+
+/**
+ * What each wire into a Generate node's Original port does. In Manual count with several originals
+ * every one is sent; the Primary original is the main one (image 1) and the rest go with it.
+ * Collections cannot be primary.
+ */
+export function originalEdgeRoles(nodes: CanvasNode[], edges: CanvasEdge[], generateId: string): Map<string, OriginalRole> {
+  const roles = new Map<string, OriginalRole>();
+  const gen = nodes.find((n) => n.id === generateId);
+  if (gen?.type !== 'generate') return roles;
+  const incoming = edges.filter((e) => e.target === generateId && e.targetHandle === 'original');
+  const manualMany = (gen.data as GenerateData).mode === 'manual' && incoming.length > 1;
+  const primary = (gen.data as GenerateData).primaryOriginalNodeId;
+  const primaryEdge = manualMany
+    ? incoming.find((e) => e.source === primary && nodes.find((n) => n.id === e.source)?.type !== 'collection')
+    : undefined;
+  for (const e of incoming) {
+    if (!manualMany) roles.set(e.id, 'used');
+    else if (!primaryEdge) roles.set(e.id, 'candidate');
+    else roles.set(e.id, e.id === primaryEdge.id ? 'primary' : 'secondary');
+  }
+  return roles;
+}
+
+/**
+ * Does this Generate node need an original image to run? Match inputs makes one result per
+ * original; "Match original" aspect needs an image to measure; a Game Screen is the screen to re-theme.
+ * Mirrors the backend rules (`backend/app/generation/plan.py`).
+ */
+export function generateNeedsOriginal(nodes: CanvasNode[], edges: CanvasEdge[], generateId: string): boolean {
+  const gen = nodes.find((n) => n.id === generateId);
+  if (gen?.type !== 'generate') return false;
+  const data = gen.data as GenerateData;
+  if (data.mode === 'match' || data.aspectRatio === 'match') return true;
+  return edges.some((e) => {
+    if (e.target !== generateId || e.targetHandle !== 'prompt') return false;
+    const prompt = nodes.find((n) => n.id === e.source);
+    return prompt?.type === 'prompt' && (prompt.data as { assetCategory?: string }).assetCategory === GAME_SCREEN;
+  });
+}
+
+/** The Input Collection an Extract Assets node fills, if one is connected to its Assets port. */
+export function extractedCollection(nodes: CanvasNode[], edges: CanvasEdge[], extractId: string): CanvasNode | null {
+  for (const e of edges) {
+    if (e.source !== extractId || e.targetHandle !== 'extract') continue;
+    const target = nodes.find((n) => n.id === e.target);
+    if (target?.type === 'collection') return target;
+  }
+  return null;
 }
 
 /** An Output Collection already fed by this Generate node, reused for new batches. */

@@ -57,8 +57,8 @@ function ItemCard({
     >
       <div className="mb-1.5 flex items-center gap-1.5">
         <span className="rounded bg-panel-2 px-1.5 font-mono text-[10px] text-ink-2">{index + 1}</span>
-        <span className="min-w-0 flex-1 truncate text-[11px] text-ink" title={asset?.name}>
-          {asset?.name ?? 'Unknown image'}
+        <span className="min-w-0 flex-1 truncate text-[11px] text-ink" title={item.label || asset?.name}>
+          {item.label || asset?.name || 'Unknown image'}
         </span>
         <label className="flex items-center gap-1 text-[11px] text-ink-2" title="Disabled images are skipped by generation">
           <input

@@ -15,12 +15,14 @@ import {
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type DragEvent,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
+import { originalEdgeRoles, type OriginalRole } from '../graph/generation';
 import { getDefinition, isNodeKind } from '../graph/registry';
 import type { CanvasEdge, CanvasNode, CollectionData, NodeKind } from '../graph/types';
 import { checkConnection } from '../graph/validation';
@@ -83,6 +85,31 @@ type ItemMenu = { x: number; y: number; title: string; items: MenuItem[] };
 
 let strokeSeq = 0;
 
+const PORT_EDGE_CLASS: Record<string, string> = {
+  prompt: 'edge-prompt',
+  original: 'edge-original',
+  theme: 'edge-theme',
+  palette: 'edge-palette',
+};
+
+/**
+ * Wires into a Generate node take their port's colour (the handle already does), so you can see
+ * which is the original. With several originals in Manual count all are sent; the primary is thick and the
+ * others lighter, and clicking another wire makes it the primary. Until one is chosen they are dashed.
+ */
+function styleEdges(nodes: CanvasNode[], edges: CanvasEdge[]): CanvasEdge[] {
+  const roles = new Map<string, OriginalRole>();
+  for (const g of nodes) {
+    if (g.type === 'generate') for (const [id, role] of originalEdgeRoles(nodes, edges, g.id)) roles.set(id, role);
+  }
+  return edges.map((e) => {
+    const port = e.targetHandle ? PORT_EDGE_CLASS[e.targetHandle] : undefined;
+    const role = roles.get(e.id);
+    const classes = [port, role && role !== 'used' ? `edge-${role}` : undefined].filter(Boolean).join(' ');
+    return classes ? { ...e, className: classes } : e;
+  });
+}
+
 export const DRAG_MIME = 'application/x-nodecanvas-node';
 /** Library drag payload: JSON array of { id, name } for stored assets. */
 export const ASSET_DRAG_MIME = 'application/x-nodecanvas-assets';
@@ -103,6 +130,7 @@ function dropTarget(e: DragEvent, count: number): ImportTarget {
 export function Canvas() {
   const nodes = useGraphStore((s) => s.nodes);
   const edges = useGraphStore((s) => s.edges);
+  const shownEdges = useMemo(() => styleEdges(nodes, edges), [nodes, edges]);
   const viewport = useGraphStore((s) => s.viewport);
   const projectId = useGraphStore((s) => s.projectId);
   const onNodesChange = useGraphStore((s) => s.onNodesChange);
@@ -138,6 +166,30 @@ export function Canvas() {
     window.addEventListener('pointerup', end);
     return () => window.removeEventListener('pointerup', end);
   }, []);
+
+  /** Clicking a wire into a Generate node's Original port makes that image the Primary original. */
+  const chooseAsPrimary = useCallback(
+    (edgeId: string) => {
+      const s = useGraphStore.getState();
+      const edge = s.edges.find((e) => e.id === edgeId);
+      const gen = edge && s.nodes.find((n) => n.id === edge.target);
+      const src = edge && s.nodes.find((n) => n.id === edge.source);
+      if (!edge || gen?.type !== 'generate' || edge.targetHandle !== 'original' || !src) return;
+      const role = originalEdgeRoles(s.nodes, s.edges, gen.id).get(edge.id);
+      if (role === 'primary' || role === 'used') return; // already the one in use
+      if (src.type === 'collection') {
+        showToast('A collection cannot be the primary original. Use Match inputs to run on all its images.', 'error');
+        return;
+      }
+      if (isNodeLocked(gen)) {
+        showToast('This Generate node is locked or generating, so its primary original cannot change now.', 'error');
+        return;
+      }
+      s.updateNodeData(gen.id, { primaryOriginalNodeId: src.id });
+      showToast(`Primary original: ${String(src.data.title)}.`);
+    },
+    [showToast],
+  );
 
   const onNodeContextMenu = useCallback(
     (e: ReactMouseEvent, node: CanvasNode) => {
@@ -318,7 +370,7 @@ export function Canvas() {
     >
       <ReactFlow<CanvasNode, CanvasEdge>
         nodes={nodes}
-        edges={edges}
+        edges={shownEdges}
         nodeTypes={nodeTypes}
         defaultViewport={viewport}
         onNodesChange={onNodesChange}
@@ -334,7 +386,11 @@ export function Canvas() {
           if (tool === 'eraser') erase({ nodeIds: [node.id] }, stroke.current ?? undefined);
         }}
         onEdgeClick={(_, edge) => {
-          if (tool === 'eraser') erase({ edgeIds: [edge.id] }, stroke.current ?? undefined);
+          if (tool === 'eraser') {
+            erase({ edgeIds: [edge.id] }, stroke.current ?? undefined);
+            return;
+          }
+          chooseAsPrimary(edge.id);
         }}
         onNodeMouseEnter={(_, node) => {
           if (stroke.current) erase({ nodeIds: [node.id] }, stroke.current);

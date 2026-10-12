@@ -28,6 +28,15 @@ const PATHS: Record<NodeKind, ReactNode> = {
       <path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65" />
     </>
   ),
+  extract: (
+    <>
+      <circle cx="6" cy="6" r="3" />
+      <path d="M8.12 8.12 12 12" />
+      <path d="M20 4 8.12 15.88" />
+      <circle cx="6" cy="18" r="3" />
+      <path d="M14.8 14.8 20 20" />
+    </>
+  ),
   generate: (
     <>
       <path d="M9.94 14.5 8.5 20l-1.44-5.5L1.5 13l5.56-1.44L8.5 6l1.44 5.56L15.5 13Z" />

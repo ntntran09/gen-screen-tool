@@ -8,6 +8,18 @@ export interface InputPort {
   multiple: boolean;
   /** Colour of the handle when it differs from the first accepted type. */
   color?: PortType;
+  /** Must be connected for the node to run. A function decides from the node's own settings. */
+  required?: boolean | ((data: Record<string, unknown>, ctx: PortContext) => boolean);
+}
+
+/** What the rest of the graph says about a node, for ports whose "required" depends on it. */
+export interface PortContext {
+  /** A Generate node that cannot run without an original image (see `generateNeedsOriginal`). */
+  needsOriginal: boolean;
+}
+
+export function isPortRequired(port: InputPort, data: Record<string, unknown>, ctx: PortContext = { needsOriginal: false }): boolean {
+  return typeof port.required === 'function' ? port.required(data, ctx) : Boolean(port.required);
 }
 
 export interface OutputPort {
@@ -99,7 +111,11 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
     label: 'Asset Collection',
     description: 'Many images behind one connection',
     color: '#2bb3a3',
-    inputs: [{ id: 'in', label: 'Generated', accepts: ['generated'], multiple: false }],
+    inputs: [
+      { id: 'in', label: 'Generated', accepts: ['generated'], multiple: false },
+      // Input collections can be filled by an Extract Assets node instead of by hand.
+      { id: 'extract', label: 'Extracted', accepts: ['extracted'], multiple: false },
+    ],
     outputs: [{ id: OUT, label: 'Assets', type: 'assetList' }],
     defaultData: () => ({
       ...base('Asset Collection'),
@@ -110,14 +126,30 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
       syncedTaskIds: [],
     }),
   },
+  extract: {
+    kind: 'extract',
+    label: 'Extract Assets',
+    description: 'Finds the separate assets in an image with AI and cuts them out',
+    color: '#c9a227',
+    inputs: [{ id: 'image', label: 'Image', accepts: ['image'], multiple: false, required: true }],
+    outputs: [{ id: OUT, label: 'Assets', type: 'extracted' }],
+    defaultData: () => ({ ...base('Extract Assets'), hint: '', detections: null, off: [] }),
+  },
   generate: {
     kind: 'generate',
     label: 'Generate',
     description: 'Combines inputs and calls the AI provider',
     color: '#3dbe6b',
     inputs: [
-      { id: 'prompt', label: 'Prompt', accepts: ['prompt'], multiple: true },
-      { id: 'original', label: 'Original', accepts: ['image', 'assetList'], multiple: true, color: 'original' },
+      { id: 'prompt', label: 'Prompt', accepts: ['prompt'], multiple: true, required: true },
+      {
+        id: 'original',
+        label: 'Original',
+        accepts: ['image', 'assetList'],
+        multiple: true,
+        color: 'original',
+        required: (_d, ctx) => ctx.needsOriginal,
+      },
       { id: 'reference', label: 'Reference', accepts: ['image'], multiple: true },
       { id: 'theme', label: 'Theme', accepts: ['image'], multiple: true, color: 'theme' },
       { id: 'palette', label: 'Palette', accepts: ['palette'], multiple: false },

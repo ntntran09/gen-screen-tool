@@ -9,9 +9,11 @@ import {
 } from '@xyflow/react';
 import { nanoid } from 'nanoid';
 import { create } from 'zustand';
+import { uuid } from '../lib/uuid';
 import { getDefinition, isNodeKind } from '../graph/registry';
 import { collectionItems, makeItems, nodeAssetId, readingOrder } from '../graph/collections';
-import { attachResults, connectedOutputCollection, type TaskResult } from '../graph/generation';
+import { assetPrompt, currentDetections, sourceAssetFor } from '../graph/detect';
+import { attachResults, connectedOutputCollection, extractedCollection, type TaskResult } from '../graph/generation';
 import { findFreeSpot } from '../graph/layout';
 import type {
   AnyNodeData,
@@ -19,6 +21,7 @@ import type {
   CanvasNode,
   CollectionData,
   CollectionItem,
+  ExtractData,
   NodeKind,
   ImageData,
   OutputData,
@@ -96,6 +99,16 @@ interface GraphState {
    * `count` defaults to the node's own setting. Resolves to false when there is nothing to read.
    */
   extractPalette: (paletteId: string, count?: number) => Promise<boolean>;
+  /**
+   * "Redraw nodes" for an Extract Assets node: lists the connected original image once per ticked asset in
+   * the Input Collection on its Assets port (each item with its own label and instruction: what the asset
+   * is and where it sits), and, unless a Generate already uses that collection, adds a Prompt and a
+   * Generate in Match inputs mode fed by it. Nothing is generated until the user presses Generate.
+   * One undo step. Returns what happened, or null when there is nothing to redraw or the collection is locked.
+   */
+  addExtractionWorkflow: (
+    extractNodeId: string,
+  ) => { collection: string; prompt: string | null; generate: string | null; count: number } | null;
   /** Replace an Input Collection with one Original node per item. */
   ungroupCollection: (id: string) => void;
   /**
@@ -152,7 +165,7 @@ function stripSelection(snapshot: Snapshot): Snapshot {
 function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
   const idMap = new Map<string, string>();
   const nodes = source.nodes.map((n) => {
-    const id = crypto.randomUUID();
+    const id = uuid();
     idMap.set(n.id, id);
     return withFlags({
       id,
@@ -177,6 +190,12 @@ function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
     }));
   return { nodes, edges };
 }
+
+/** Prompt for redrawing found assets; {asset_name} is each asset's label, filled per task. */
+export const EXTRACT_PROMPT =
+  'Redraw the {asset_name} from the original image as a clean, standalone game asset: a single isolated object with ' +
+  'the same design, colors and proportions as it has in the original, polished and sharp, centered with even margins, ' +
+  'on a transparent background. Show only that one asset and nothing else from the original image.';
 
 /** Old projects had separate Original / Theme nodes; both are an Image node now (role = port). */
 function upgradeLegacyNode<T extends { type: string; data: Record<string, unknown> }>(n: T): T {
@@ -386,7 +405,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       get().commit();
       const created = items.map(({ kind, position, data }) =>
         withFlags({
-          id: crypto.randomUUID(),
+          id: uuid(),
           type: kind,
           position,
           data: { ...getDefinition(kind).defaultData(), ...data } as AnyNodeData,
@@ -449,7 +468,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
         if (n.type === 'image') items[i].promptOverride = (n.data as ImageData).instructions ?? '';
       });
       const collection = withFlags({
-        id: crypto.randomUUID(),
+        id: uuid(),
         type: 'collection',
         position: {
           x: Math.min(...members.map((n) => n.position.x)),
@@ -484,6 +503,98 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       return collection.id;
     },
 
+    addExtractionWorkflow: (extractNodeId) => {
+      const { nodes, edges, commit, showToast } = get();
+      const extract = nodes.find((n) => n.id === extractNodeId);
+      if (extract?.type !== 'extract') return null;
+      const data = extract.data as ExtractData;
+      const assetId = sourceAssetFor(nodes, edges, extractNodeId);
+      const found = currentDetections(data, assetId);
+      const off = new Set(data.off ?? []);
+      const chosen = found ? found.items.filter((_, i) => !off.has(i)) : [];
+      if (!assetId || chosen.length === 0) return null;
+      const existing = extractedCollection(nodes, edges, extractNodeId);
+      if (existing && isNodeLocked(existing)) {
+        showToast('The connected collection is locked. Unlock it to replace its list.', 'error');
+        return null;
+      }
+      commit();
+      // The same full image, once per asset: the label names it and the override says which asset to take.
+      const items: CollectionItem[] = chosen.map((asset) => ({
+        id: nanoid(10),
+        assetId,
+        enabled: true,
+        label: asset.name,
+        promptOverride: assetPrompt(asset),
+      }));
+      let nextNodes = nodes.map((n) => (n.selected ? { ...n, selected: false } : n));
+      let nextEdges = edges;
+      const wire = (from: string, to: string, handle: string): CanvasEdge => ({
+        id: `e-${nanoid(10)}`,
+        source: from,
+        sourceHandle: 'out',
+        target: to,
+        targetHandle: handle,
+      });
+      let collection: CanvasNode;
+      if (existing) {
+        collection = { ...existing, data: { ...existing.data, items } as AnyNodeData };
+        nextNodes = nextNodes.map((n) => (n.id === existing.id ? collection : n));
+      } else {
+        collection = withFlags({
+          id: uuid(),
+          type: 'collection',
+          position: findFreeSpot({ x: extract.position.x + 330, y: extract.position.y }, nodes),
+          data: { ...getDefinition('collection').defaultData(), title: 'Assets to redraw', items } as AnyNodeData,
+        });
+        nextNodes = [...nextNodes, collection];
+        nextEdges = [...nextEdges, wire(extractNodeId, collection.id, 'extract')];
+      }
+      // A Generate that already reads this collection keeps working with the refreshed list.
+      const hasGenerate = nextEdges.some(
+        (e) => e.source === collection.id && e.targetHandle === 'original' && nodes.find((n) => n.id === e.target)?.type === 'generate',
+      );
+      let promptId: string | null = null;
+      let generateId: string | null = null;
+      if (!hasGenerate) {
+        const origin = findFreeSpot({ x: collection.position.x + 360, y: collection.position.y }, nextNodes);
+        const prompt = withFlags({
+          id: uuid(),
+          type: 'prompt',
+          position: { x: origin.x, y: origin.y - 260 },
+          data: {
+            ...getDefinition('prompt').defaultData(),
+            title: 'Redraw each asset',
+            text: EXTRACT_PROMPT,
+            assetCategory: 'Item',
+            // The original is a whole screen, not one asset to keep intact.
+            preserveSubject: false,
+            preserveSilhouette: false,
+          } as AnyNodeData,
+        });
+        const generate = withFlags({
+          id: uuid(),
+          type: 'generate',
+          position: origin,
+          data: {
+            ...getDefinition('generate').defaultData(),
+            title: 'Redraw assets',
+            mode: 'match',
+            aspectRatio: '1:1',
+            background: 'transparent',
+          } as AnyNodeData,
+          selected: true,
+        });
+        nextNodes = [...nextNodes, prompt, generate];
+        nextEdges = [...nextEdges, wire(prompt.id, generate.id, 'prompt'), wire(collection.id, generate.id, 'original')];
+        promptId = prompt.id;
+        generateId = generate.id;
+      }
+      set({ nodes: nextNodes, edges: nextEdges });
+      touch();
+      return { collection: collection.id, prompt: promptId, generate: generateId, count: items.length };
+    },
+
     ungroupCollection: (id) => {
       const { nodes, edges, commit, showToast } = get();
       const node = nodes.find((n) => n.id === id);
@@ -496,7 +607,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       commit();
       const created = items.map((item, i) =>
         withFlags({
-          id: crypto.randomUUID(),
+          id: uuid(),
           type: 'image' as const,
           position: { x: node.position.x + (i % 4) * 230, y: node.position.y + Math.floor(i / 4) * 290 },
           data: { ...getDefinition('image').defaultData(), assetId: item.assetId, instructions: item.promptOverride } as AnyNodeData,
@@ -542,7 +653,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
           ? { ...fresh, title: `${gen.data.title} results`, role: 'output', batchIds: [batchId] }
           : { ...fresh, title: `${gen.data.title} result`, generationId: batchId };
       const node = withFlags({
-        id: crypto.randomUUID(),
+        id: uuid(),
         type: kind,
         position: findFreeSpot({ x: gen.position.x + 320, y: gen.position.y }, nodes),
         data: data as AnyNodeData,

@@ -1,6 +1,6 @@
 import type { Edge, Node } from '@xyflow/react';
 
-export type NodeKind = 'prompt' | 'image' | 'palette' | 'collection' | 'generate' | 'output';
+export type NodeKind = 'prompt' | 'image' | 'palette' | 'collection' | 'extract' | 'generate' | 'output';
 
 /** Older saved projects had separate Original / Theme image nodes; they load as `image`. */
 export const LEGACY_IMAGE_KINDS = ['original', 'theme'] as const;
@@ -9,7 +9,7 @@ export const LEGACY_IMAGE_KINDS = ['original', 'theme'] as const;
  * Value types that flow along edges (spec §25.1). `original` and `theme` are only port
  * colours now: every image node outputs `image`, and its role comes from the port it feeds.
  */
-export type PortType = 'prompt' | 'image' | 'original' | 'theme' | 'palette' | 'assetList' | 'generated';
+export type PortType = 'prompt' | 'image' | 'original' | 'theme' | 'palette' | 'assetList' | 'extracted' | 'generated';
 
 export interface BaseNodeData {
   title: string;
@@ -60,6 +60,16 @@ export type ThemeRole = (typeof THEME_ROLES)[number];
  * One image. What it is used as (original, theme or reference) is decided by the Generate
  * port it connects to, so it carries the settings for every role.
  */
+/** One asset an AI model found in an image, as a box relative to the image (0..1). */
+export interface DetectedAsset {
+  name: string;
+  description: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface ImageData extends BaseNodeData {
   assetId: string | null;
   notes: string;
@@ -95,6 +105,8 @@ export interface CollectionItem {
   enabled: boolean;
   /** Extra prompt text used only for this image (spec "per-asset prompt override"). */
   promptOverride: string;
+  /** Names this item instead of the image's file name (one image can be listed once per asset to redraw). */
+  label?: string;
 }
 
 export interface CollectionData extends BaseNodeData {
@@ -127,6 +139,19 @@ export const ASSET_CATEGORIES = [
   'Other',
 ] as const;
 
+/**
+ * Extract Assets: finds the separate assets in the connected image with a small ChatGPT model and marks
+ * where they are. "Redraw nodes" then builds a collection that lists the original image once per asset
+ * (each with its own instruction) plus a Prompt and a Generate that redraw them.
+ */
+export interface ExtractData extends BaseNodeData {
+  hint: string;
+  /** Result of the last search, for the image it was run on (ignored once that image changes). */
+  detections: { assetId: string; model: string | null; seconds: number; items: DetectedAsset[] } | null;
+  /** Indexes of detections the user unticked. */
+  off: number[];
+}
+
 export interface GenerateData extends BaseNodeData {
   providerId: string;
   model: string;
@@ -155,6 +180,7 @@ export interface NodeDataByKind {
   image: ImageData;
   palette: PaletteData;
   collection: CollectionData;
+  extract: ExtractData;
   generate: GenerateData;
   output: OutputData;
 }

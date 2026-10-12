@@ -83,7 +83,13 @@ def _capability_errors(plan: Plan, registry: ProviderRegistry) -> list[tuple[str
         errors.append(("UNSUPPORTED_CAPABILITY", f"{provider.name} cannot create images from text only."))
     if "edit" in ops and caps.image_editing == "unsupported":
         errors.append(("UNSUPPORTED_CAPABILITY", f"{provider.name} cannot work from input images."))
-    images = max((bool(t.original_asset_id) + len(t.theme_asset_ids) + len(t.reference_asset_ids) for t in plan.tasks), default=0)
+    images = max(
+        (
+            bool(t.original_asset_id) + len(t.extra_original_asset_ids) + len(t.theme_asset_ids) + len(t.reference_asset_ids)
+            for t in plan.tasks
+        ),
+        default=0,
+    )
     if caps.max_reference_images is not None and images > caps.max_reference_images:
         errors.append(
             ("REFERENCE_LIMIT_EXCEEDED", f"{provider.name} accepts at most {caps.max_reference_images} images per request; this needs {images}.")
@@ -123,6 +129,7 @@ async def preview(body: PlanBody, conn: Conn, settings: Cfg, registry: Registry)
                 "slot_index": t.slot_index,
                 "variant_index": t.variant_index,
                 "source_asset_id": t.original_asset_id,
+                "extra_original_asset_ids": t.extra_original_asset_ids,
                 "source_name": t.source.name if t.source else None,
                 "operation": t.operation,
                 "aspect_ratio": t.aspect_ratio,
@@ -186,6 +193,7 @@ async def create(body: PlanBody, conn: Conn, settings: Cfg, registry: Registry, 
                         {
                             "operation": t.operation,
                             "original_asset_id": t.original_asset_id,
+                            "extra_original_asset_ids": t.extra_original_asset_ids,
                             "theme_asset_ids": t.theme_asset_ids,
                             "reference_asset_ids": t.reference_asset_ids,
                             "settings": {**plan.settings, "aspect_ratio": t.aspect_ratio},

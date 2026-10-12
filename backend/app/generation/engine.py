@@ -295,7 +295,9 @@ class GenerationEngine:
                 return
             try:
                 original = self._read_asset(conn, request.get("original_asset_id"))
-                extras = [self._read_asset(conn, a) for a in request["theme_asset_ids"] + request["reference_asset_ids"]]
+                # Order matters: the prompt numbers the images (original, extra originals, themes, references).
+                ids = [*request.get("extra_original_asset_ids", []), *request["theme_asset_ids"], *request["reference_asset_ids"]]
+                extras = [self._read_asset(conn, a) for a in ids]
             except AssetError as exc:
                 # Never send a request built from an incomplete set of images (spec §29.8).
                 self._finish(conn, task_id, "failed", error=("INVALID_INPUT", exc.message))

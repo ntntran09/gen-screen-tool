@@ -27,6 +27,7 @@ OUTPUT_TYPE = {
     "theme": "image",
     "palette": "palette",
     "collection": "assetList",
+    "extract": "extracted",  # an Extract Assets node fills an Input Collection through its "extract" port
     "generate": "generated",
     "output": "image",
 }
@@ -40,7 +41,8 @@ INPUT_PORTS: dict[str, dict[str, tuple[tuple[str, ...], bool]]] = {
         "palette": (("palette",), False),
     },
     "palette": {"image": (("image",), False)},
-    "collection": {"in": (("generated",), False)},
+    "extract": {"image": (("image",), False)},
+    "collection": {"in": (("generated",), False), "extract": (("extracted",), False)},
     "output": {"in": (("generated",), False)},
 }
 
@@ -130,6 +132,8 @@ class TaskPlan:
     theme_asset_ids: list[str]
     reference_asset_ids: list[str]
     aspect_ratio: str = "1:1"  # resolved per task when the setting is "Match original"
+    # Manual count with several originals: the primary is the main one; these are sent along with it.
+    extra_original_asset_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -195,8 +199,10 @@ def validate_edges(graph: Graph, errors: list[str]) -> None:
             errors.append(f"'{_title(src)}' cannot connect to the {e.targetHandle} port of '{_title(dst)}'.")
         if src.type == "collection" and src.data.get("role") != "input":
             errors.append(f"Only an Input Collection can feed a Generate node ('{_title(src)}').")
-        if dst.type == "collection" and dst.data.get("role") != "output":
+        if dst.type == "collection" and e.targetHandle == "in" and dst.data.get("role") != "output":
             errors.append(f"Generated results can only go to an Output Collection ('{_title(dst)}').")
+        if dst.type == "collection" and e.targetHandle == "extract" and dst.data.get("role") != "input":
+            errors.append(f"Extracted assets can only go to an Input Collection ('{_title(dst)}').")
         key = (e.source, e.sourceHandle, e.target, e.targetHandle)
         if key in seen:
             errors.append(f"Duplicate connection into '{_title(dst)}'.")
@@ -330,7 +336,7 @@ def build_plan(
                     instructions=instructions,
                 )
             )
-        elif n.type == "collection":
+        else:
             for item in n.data.get("items") or []:
                 if not item.get("enabled", True):
                     continue
@@ -341,7 +347,8 @@ def build_plan(
                 sources.append(
                     Source(
                         asset_id=item["assetId"],
-                        name=stem(assets[item["assetId"]].name),
+                        # An item may carry its own label (the same image listed once per asset to redraw).
+                        name=str(item.get("label") or "").strip()[:80] or stem(assets[item["assetId"]].name),
                         node_id=n.id,
                         collection_name=_title(n),
                         preserve=list(gen_preserve),
@@ -393,16 +400,21 @@ def build_plan(
         elif original_nodes and not errors:
             errors.append("The connected originals have no enabled images to generate from.")
         layout = [(chosen, 1 if chosen else None, v) for v in range(1, count + 1)]
+    if is_screen and not any(s for s, _, _ in layout):
+        errors.append("Game Screen needs an original image: connect the screen to re-theme to the Original port.")
     if d.get("aspectRatio") == MATCH_ASPECT and not any(s for s, _, _ in layout):
         errors.append("Aspect ratio 'Match original' needs an original image. Pick a fixed aspect ratio instead.")
     if len(layout) > MAX_TASKS:
         errors.append(f"This would create {len(layout)} tasks; the limit is {MAX_TASKS}. Split the batch into smaller ones.")
 
-    per_task_images = (1 if any(s for s, _, _ in layout) else 0) + len(theme_ids) + len(ref_ids)
+    # Manual count sends every connected original (the primary first); Match inputs sends one per task.
+    has_original = any(s for s, _, _ in layout)
+    extras_per_task = len(sources) - 1 if mode != "match" and has_original else 0
+    per_task_images = (1 if has_original else 0) + extras_per_task + len(theme_ids) + len(ref_ids)
     if per_task_images > max_input_images:
         errors.append(
             f"Each request would attach {per_task_images} images; NodeCanvas allows at most {max_input_images}. "
-            "Remove some Theme or Reference images."
+            "Remove some Original, Theme or Reference images."
         )
 
     settings = {
@@ -444,6 +456,7 @@ def build_plan(
             where = f' from the collection "{source.collection_name}"' if source.collection_name else ""
             sections.append(f"Asset: {source.name}{where}.")
 
+        extras = [s for s in sources if s is not source] if (mode != "match" and source) else []
         next_image = 1
         if source:  # 3. Original image instructions
             text = "Original image: attached image 1 is the original asset to transform."
@@ -451,8 +464,13 @@ def build_plan(
                 text += " Preserve its " + _join([PRESERVE_LABELS.get(k, k) for k in source.preserve]) + "."
             if source.instructions:
                 text += " " + fill(source.instructions)
+            if extras:
+                text += (
+                    f" Additional originals: {_images_phrase(2, len(extras))} also provided as original assets"
+                    " (secondary); use them together with image 1."
+                )
             sections.append(text)
-            next_image = 2
+            next_image = 2 + len(extras)
 
         if theme_ids:  # 4. Theme references
             follow = _join(theme_labels) if theme_labels else "overall look"
@@ -516,6 +534,7 @@ def build_plan(
                 theme_asset_ids=list(theme_ids),
                 reference_asset_ids=list(ref_ids),
                 aspect_ratio=aspect,
+                extra_original_asset_ids=[s.asset_id for s in extras],
             )
         )
 

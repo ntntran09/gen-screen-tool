@@ -106,6 +106,8 @@ export const api = {
     request<{ deleted: string[] }>('POST', `/projects/${encodeURIComponent(projectId)}/assets/delete`, { asset_ids: assetIds }),
   assetPalette: (id: string, count: number) =>
     request<{ colors: { hex: string; share: number }[] }>('GET', `/assets/${encodeURIComponent(id)}/palette?count=${count}`),
+  detectAssets: (assetId: string, providerId: string, hint: string) =>
+    request<DetectResult>('POST', `/assets/${encodeURIComponent(assetId)}/detect`, { provider_id: providerId, hint }),
   getAsset: (id: string) => request<AssetInfo>('GET', `/assets/${encodeURIComponent(id)}`),
   renameAsset: (id: string, name: string) => request<AssetInfo>('PATCH', `/assets/${encodeURIComponent(id)}`, { name }),
   importAssets: async (projectId: string, files: File[]): Promise<ImportResult> => {
@@ -253,6 +255,7 @@ export interface GenerationPreview {
     slot_index: number;
     variant_index: number;
     source_asset_id: string | null;
+    extra_original_asset_ids?: string[];
     source_name: string | null;
     operation: 'generate' | 'edit';
     prompt: string;
@@ -306,6 +309,13 @@ export interface AssetInfo {
   missing: boolean;
   /** Removed from the library; the file was moved to backups. */
   deleted?: boolean;
+}
+
+export interface DetectResult {
+  asset_id: string;
+  model: string | null;
+  elapsed_seconds: number;
+  assets: { name: string; description: string; x: number; y: number; w: number; h: number }[];
 }
 
 export interface ImportResult {

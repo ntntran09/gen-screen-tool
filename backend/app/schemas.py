@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-NODE_TYPES = ("prompt", "image", "original", "theme", "palette", "collection", "generate", "output")
+NODE_TYPES = ("prompt", "image", "original", "theme", "palette", "collection", "extract", "generate", "output")
 
 
 class Viewport(BaseModel):

@@ -14,6 +14,7 @@ import {
   type AnyNodeData,
   type CanvasNode,
   type CollectionData,
+  type ExtractData,
   type GenerateData,
   type ImageData,
   type OutputData,
@@ -25,11 +26,13 @@ import { useImageImport } from '../hooks/useImageImport';
 import { formatDuration, taskMs } from '../hooks/useBatchTime';
 import { useImageRoles } from '../hooks/useImageRoles';
 import { api, assetUrls, type ProviderInfo } from '../lib/api';
+import { copyText } from '../lib/clipboard';
 import { pickImageFiles } from '../lib/filePicker';
 import { useAssetStore } from '../store/assetStore';
 import { latestAttempts, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
 import { isNodeFrozen, useGraphStore } from '../store/graphStore';
 import { AssetThumb, formatBytes } from './AssetThumb';
+import { ExtractFields } from './ExtractFields';
 import { Button, NumberInput, Section, Select, TextArea, TextInput, Toggle } from './fields';
 
 const PRESERVE_LABELS: Record<(typeof PRESERVATION_OPTIONS)[number], string> = {
@@ -121,7 +124,7 @@ function PromptFields({ nodeId, data, update }: { nodeId: string; data: PromptDa
         />
         <NumberInput label="Order" value={data.order} min={0} max={99} onChange={(order) => update({ order })} />
         <Toggle label="Enabled" checked={data.enabled} onChange={(enabled) => update({ enabled })} />
-        <Button onClick={() => void navigator.clipboard.writeText(data.text)} disabled={!data.text}>
+        <Button onClick={() => void copyText(data.text)} disabled={!data.text}>
           Copy prompt
         </Button>
       </Section>
@@ -543,7 +546,7 @@ function PaletteFields({ nodeId, data, update }: { nodeId: string; data: Palette
           <Button onClick={() => update({ colors: [...data.colors, { id: nanoid(8), hex: '#FFFFFF', role: 'accent', ratio: null }] })}>
             Add color
           </Button>
-          <Button onClick={() => void navigator.clipboard.writeText(data.colors.map((c) => c.hex).join(', '))} disabled={data.colors.length === 0}>
+          <Button onClick={() => void copyText(data.colors.map((c) => c.hex).join(', '))} disabled={data.colors.length === 0}>
             Copy HEX
           </Button>
         </div>
@@ -691,7 +694,7 @@ function GenerateFields({ id, data, update }: { id: string; data: GenerateData; 
               ...primaryOptions.map((n) => ({ value: n.id, label: n.title })),
             ]}
             onChange={(v) => update({ primaryOriginalNodeId: v || null })}
-            hint="Several originals are connected. Pick one, or switch to Match inputs."
+            hint="All connected originals are sent. The primary is the main one (image 1): pick it here or click its wire on the canvas. Or switch to Match inputs for one result per original."
           />
         )}
       </Section>
@@ -824,6 +827,7 @@ export function Inspector() {
         {node.type === 'output' && <OutputFields node={node} />}
         {node.type === 'palette' && <PaletteFields nodeId={node.id} data={d as PaletteData} update={update} />}
         {node.type === 'collection' && <CollectionFields nodeId={node.id} data={d as CollectionData} update={update} />}
+        {node.type === 'extract' && <ExtractFields nodeId={node.id} data={d as ExtractData} update={update} />}
         {node.type === 'generate' && <GenerateFields id={node.id} data={d as GenerateData} update={update} />}
       </fieldset>
       <div className="flex gap-2 px-4 py-4">

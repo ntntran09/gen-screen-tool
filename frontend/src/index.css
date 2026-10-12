@@ -32,6 +32,8 @@
   --color-danger: #d64545;
   --color-danger-soft: #fde8e6;
   --color-overlay: rgb(26 26 26 / 0.45);
+  /* For a viewer that opens on top of another dialog: nothing behind may show through. */
+  --color-overlay-strong: rgb(18 18 18 / 0.92);
 
   --color-port-prompt: #4c8df6;
   --color-port-image: #9a948c;
@@ -39,6 +41,7 @@
   --color-port-theme: #9b6bdf;
   --color-port-palette: #ee979b;
   --color-port-assetList: #2bb3a3;
+  --color-port-extracted: #c9a227;
   --color-port-generated: #3dbe6b;
 }
 
@@ -179,6 +182,49 @@ body {
 
 .react-flow__handle.valid {
   outline: 2px solid var(--color-success);
+}
+
+/* Wires into a Generate node take the colour of the port they enter. */
+.react-flow__edge.edge-prompt .react-flow__edge-path {
+  stroke: var(--color-port-prompt);
+}
+
+.react-flow__edge.edge-original .react-flow__edge-path {
+  stroke: var(--color-port-original);
+}
+
+.react-flow__edge.edge-theme .react-flow__edge-path {
+  stroke: var(--color-port-theme);
+}
+
+.react-flow__edge.edge-palette .react-flow__edge-path {
+  stroke: var(--color-port-palette);
+}
+
+/* Several originals in Manual count: all are sent; the primary (image 1) is thick, the others lighter.
+   While none is chosen yet they are dashed. */
+.react-flow__edge.edge-primary .react-flow__edge-path {
+  stroke-width: 4;
+}
+
+.react-flow__edge.edge-candidate .react-flow__edge-path {
+  stroke-dasharray: 7 6;
+}
+
+.react-flow__edge.edge-secondary .react-flow__edge-path {
+  opacity: 0.4;
+}
+
+.react-flow__edge.edge-candidate:hover .react-flow__edge-path,
+.react-flow__edge.edge-secondary:hover .react-flow__edge-path {
+  stroke-width: 3;
+  opacity: 1;
+}
+
+.react-flow__edge-textbg {
+  fill: var(--color-panel);
+  stroke: var(--color-outline);
+  stroke-width: 1;
 }
 
 .react-flow__edge.selected .react-flow__edge-path {

@@ -9,11 +9,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 from typing import Any
 
 from PIL import Image, ImageDraw
 
-from .base import AuthState, Capabilities, GenerateRequest, GenerateResult, ImageProvider, ProviderError
+from .base import AnalysisResult, AuthState, Capabilities, GenerateRequest, GenerateResult, ImageProvider, ProviderError
 
 SIZES = {"1:1": (512, 512), "3:4": (384, 512), "9:16": (288, 512), "4:3": (512, 384), "16:9": (512, 288)}
 
@@ -50,6 +51,15 @@ class FakeProvider(ImageProvider):
         buf = io.BytesIO()
         img.save(buf, "PNG")
         return GenerateResult(image_bytes=buf.getvalue(), mime_type="image/png", reported_model="placeholder")
+
+    async def analyze_image(self, image: bytes, prompt: str, *, instructions: str, model: str) -> AnalysisResult:
+        """A fixed 2x2 "detection" so the whole Find-assets flow can be tried without quota."""
+        await asyncio.sleep(self.delay / 2)
+        boxes = [
+            {"name": f"asset {i + 1}", "description": "placeholder", "box": [x, y, x + 450, y + 450]}
+            for i, (x, y) in enumerate([(30, 30), (520, 30), (30, 520), (520, 520)])
+        ]
+        return AnalysisResult(text=json.dumps({"assets": boxes}), reported_model="placeholder")
 
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         return await self._draw(request)

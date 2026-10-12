@@ -15,7 +15,7 @@ const NODE_GROUPS: { id: string; label: string; kinds: NodeKind[] }[] = [
   { id: 'all', label: 'All', kinds: ADDABLE_KINDS },
   { id: 'inputs', label: 'Inputs', kinds: ['prompt', 'palette'] },
   { id: 'images', label: 'Images', kinds: ['image', 'collection'] },
-  { id: 'ai', label: 'AI', kinds: ['generate'] },
+  { id: 'ai', label: 'AI', kinds: ['extract', 'generate'] },
 ];
 
 

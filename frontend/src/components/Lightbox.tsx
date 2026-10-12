@@ -28,7 +28,7 @@ export function Lightbox() {
       role="dialog"
       aria-modal="true"
       aria-label={asset?.name ?? 'Image preview'}
-      className="fixed inset-0 z-50 flex flex-col bg-overlay p-6"
+      className="fixed inset-0 z-50 flex flex-col bg-overlay-strong p-6"
       onMouseDown={close}
     >
       <div className="mb-3 flex items-center gap-3 text-[13px] text-white" onMouseDown={(e) => e.stopPropagation()}>

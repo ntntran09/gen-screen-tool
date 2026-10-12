@@ -2,6 +2,7 @@ import { useNodeConnections, type NodeProps, type NodeTypes } from '@xyflow/reac
 import type {
   CanvasNode,
   CollectionData,
+  ExtractData,
   GenerateData,
   ImageData,
   OutputData,
@@ -17,6 +18,8 @@ import { formatDuration, useBatchTime } from '../hooks/useBatchTime';
 import { useImageRoles } from '../hooks/useImageRoles';
 import { pickImageFiles } from '../lib/filePicker';
 import { useAssetStore } from '../store/assetStore';
+import { currentDetections, sourceAssetFor } from '../graph/detect';
+import { useExtractStore } from '../store/extractStore';
 import { isRunning, latestBatchFor, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
 import { useGraphStore } from '../store/graphStore';
 import { NodeShell } from './NodeShell';
@@ -107,8 +110,6 @@ function PaletteNode(props: P) {
 }
 
 const PREVIEW_SLOTS = 8;
-/** Batches larger than this ask for confirmation: every image is a request against the user's quota. */
-const CONFIRM_ABOVE = 4;
 const nodeBtn =
   'nodrag rounded-md border-2 border-outline bg-node px-2 py-0.5 text-[11px] font-medium text-ink hover:bg-accent-soft';
 
@@ -131,7 +132,7 @@ function CollectionNode(props: P) {
     <NodeShell
       node={props}
       width={260}
-      hiddenInputs={data.role === 'input' ? ['in'] : []}
+      hiddenInputs={data.role === 'input' ? ['in'] : ['extract']}
       badge={<span className="text-[10px] uppercase tracking-wide text-ink-3">{data.role}</span>}
     >
       {items.length === 0 ? (
@@ -197,6 +198,44 @@ function CollectionNode(props: P) {
           </button>
         )}
       </div>
+    </NodeShell>
+  );
+}
+
+function ExtractNode(props: P) {
+  const data = props.data as ExtractData;
+  const assetId = useGraphStore((s) => sourceAssetFor(s.nodes, s.edges, props.id));
+  const busy = useExtractStore((s) => s.busy[props.id]);
+  const error = useExtractStore((s) => s.error[props.id]);
+  const { detect } = useExtractStore.getState();
+  const found = currentDetections(data, assetId);
+  const chosen = found ? found.items.filter((_, i) => !data.off.includes(i)).length : 0;
+  // One main action: find first; the inspector has the review and the Redraw button.
+  return (
+    <NodeShell node={props} width={260}>
+      <div className="space-y-1.5 text-[12px] text-ink-2">
+        {!assetId && <p className="text-warning">Connect an Image with a picture</p>}
+        {assetId && !found && <p>{data.detections ? 'Image changed: find again' : 'Ready to find assets'}</p>}
+        {found && (
+          <p>
+            Found <span className="font-semibold text-ink">{found.items.length}</span> ·{' '}
+            <span className="font-semibold text-ink">{chosen}</span> ticked
+          </p>
+        )}
+        {found && <p className="text-ink-3">Review and build the redraw nodes in the panel on the right.</p>}
+        {error && <p className="text-danger">{error}</p>}
+      </div>
+      {assetId && (
+        <button
+          type="button"
+          disabled={busy !== undefined || data.locked}
+          aria-busy={busy !== undefined}
+          onClick={() => void detect(props.id)}
+          className="nodrag mt-2 w-full rounded-lg border-2 border-outline bg-accent py-1.5 text-[12px] font-semibold text-accent-ink hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {busy === 'detect' ? 'Looking…' : found ? 'Find again' : 'Find assets'}
+        </button>
+      )}
     </NodeShell>
   );
 }
@@ -274,10 +313,7 @@ function GenerateNode(props: P) {
         type="button"
         disabled={running || starting || problems.length > 0 || data.locked}
         aria-busy={running || starting}
-        onClick={() => {
-          if (expected > CONFIRM_ABOVE && !window.confirm(`Generate ${expected} images? Each one is a separate request to your account.`)) return;
-          void start(props.id);
-        }}
+        onClick={() => void start(props.id)}
         className="nodrag mt-2 w-full rounded-lg border-2 border-outline bg-accent py-1.5 text-[12px] font-semibold text-accent-ink hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
         title={problems[0]}
       >
@@ -305,6 +341,7 @@ export const nodeTypes: NodeTypes = {
   image: ImageNode,
   palette: PaletteNode,
   collection: CollectionNode,
+  extract: ExtractNode,
   generate: GenerateNode,
   output: OutputNode,
 };

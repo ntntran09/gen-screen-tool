@@ -71,6 +71,12 @@ class GenerateResult:
     reported_settings: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class AnalysisResult:
+    text: str
+    reported_model: str | None = None
+
+
 class ImageProvider(ABC):
     id: str
     name: str
@@ -97,3 +103,7 @@ class ImageProvider(ABC):
 
     @abstractmethod
     def normalize_error(self, exc: BaseException) -> ProviderError: ...
+
+    async def analyze_image(self, image: bytes, prompt: str, *, instructions: str, model: str) -> AnalysisResult:
+        """Look at an image with a small chat model and answer in text. Optional capability."""
+        raise ProviderError("UNSUPPORTED_CAPABILITY", f"{self.name} cannot analyse images.")

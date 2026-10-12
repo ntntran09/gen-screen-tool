@@ -24,6 +24,16 @@ Data is stored in `workspace/NodeCanvasAI/` (override with `NODECANVAS_WORKSPACE
 
 To try generation without using ChatGPT quota, start the backend with `NODECANVAS_FAKE_PROVIDER=1` and pick "Local placeholder (testing)" as the Generate node's provider (better with a separate `NODECANVAS_WORKSPACE`).
 
+## Open it to the local network (LAN)
+
+```bash
+cd frontend && npm run dev:lan
+```
+
+Then open `http://<this-pc-ip>:5173` from another device on the same network (find the IP with `ipconfig`). Only the web server listens on all interfaces; the backend stays on `127.0.0.1` behind its proxy, and requests from other websites are still rejected.
+
+**There is no sign-in.** Anyone who can reach that address can use the app: see every project and generate images with the signed-in ChatGPT account (quota). Use it only on a network you trust, and stop it (`npm run dev` instead) when you are done. Windows will ask to allow Node.js through the firewall the first time. Devices on a VPN such as Tailscale can reach it too.
+
 ## Tests
 
 ```bash

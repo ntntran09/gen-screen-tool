@@ -179,6 +179,7 @@ function PreviewBody({ nodeId }: { nodeId: string }) {
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-3">
                 <Thumbs label="Original (this task)" ids={task?.source_asset_id ? [task.source_asset_id] : []} />
+                <Thumbs label="More originals (sent with it)" ids={task?.extra_original_asset_ids ?? []} />
                 <Thumbs label="Theme images" ids={preview.theme_asset_ids ?? []} />
                 <Thumbs label="Reference images" ids={preview.reference_asset_ids ?? []} />
                 {(preview.palette?.length ?? 0) > 0 && (

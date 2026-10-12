@@ -127,6 +127,105 @@ describe('palette from an image', () => {
   });
 });
 
+describe('extraction workflow', () => {
+  const boxes = [
+    { name: 'blue pot', description: 'a pot with {blue} flowers', x: 0.1, y: 0.1, w: 0.2, h: 0.2 },
+    { name: 'pause button', description: 'round', x: 0.8, y: 0.0, w: 0.1, h: 0.05 },
+    { name: 'cat', description: 'orange cat', x: 0.0, y: 0.85, w: 0.2, h: 0.15 },
+  ];
+  /** An Image with a picture -> Extract node that has already "found" the boxes. */
+  const found = (off: number[] = []) => {
+    const src = s().addNode('image', { x: 0, y: 0 }, { assetId: 'screen' });
+    const ex = s().addNode('extract', { x: 300, y: 0 });
+    s().connect({ source: src, sourceHandle: OUT, target: ex, targetHandle: 'image' });
+    s().updateNodeData(ex, { detections: { assetId: 'screen', model: 'm', seconds: 1, items: boxes }, off });
+    return { src, ex };
+  };
+  const get = (id: string) => s().nodes.find((n) => n.id === id)!;
+  const itemsOf = (id: string) => (get(id).data as { items: { assetId: string; label: string; promptOverride: string }[] }).items;
+
+  it('lists the full original once per ticked asset, with its own label and instruction, and builds the redraw nodes', () => {
+    const { ex } = found([1]); // the pause button is unticked
+    const before = s().nodes.length;
+    const made = s().addExtractionWorkflow(ex)!;
+    expect(made.count).toBe(2);
+    expect(s().nodes).toHaveLength(before + 3); // collection, prompt, generate
+
+    const items = itemsOf(made.collection);
+    expect(items.map((i) => [i.assetId, i.label])).toEqual([['screen', 'blue pot'], ['screen', 'cat']]); // always the full image
+    expect(items[0].promptOverride).toContain('"blue pot"');
+    expect(items[0].promptOverride).toContain('top left'); // where it is, in words
+    expect(items[0].promptOverride).toContain('10-30% across'); // and roughly
+    expect(items[0].promptOverride).not.toMatch(/[{}]/); // braces would read as placeholders
+    expect(items[1].promptOverride).toContain('bottom left');
+    expect(get(made.collection).data).toMatchObject({ role: 'input', title: 'Assets to redraw' });
+
+    expect((get(made.prompt!).data as { text: string }).text).toContain('{asset_name}');
+    expect(get(made.prompt!).data).toMatchObject({ preserveSubject: false, preserveSilhouette: false });
+    expect(get(made.generate!).data).toMatchObject({ mode: 'match', aspectRatio: '1:1', background: 'transparent' });
+    const wires = s().edges.map((e) => [e.source, e.target, e.targetHandle]);
+    expect(wires).toEqual(
+      expect.arrayContaining([
+        [ex, made.collection, 'extract'],
+        [made.prompt, made.generate, 'prompt'],
+        [made.collection, made.generate, 'original'],
+      ]),
+    );
+    s().undo(); // all of it is one undo step
+    expect(s().nodes).toHaveLength(before);
+  });
+
+  it('pressing it again refreshes the list but does not add a second prompt and generate', () => {
+    const { ex } = found();
+    const first = s().addExtractionWorkflow(ex)!;
+    const nodes = s().nodes.length;
+    s().updateNodeData(ex, { off: [0, 1] }); // now only the cat
+    const again = s().addExtractionWorkflow(ex)!;
+    expect(again.collection).toBe(first.collection);
+    expect(again.generate).toBeNull();
+    expect(s().nodes).toHaveLength(nodes);
+    expect(itemsOf(first.collection).map((i) => i.label)).toEqual(['cat']);
+  });
+
+  it('does nothing without a current search, with everything unticked, or into a locked collection', () => {
+    expect(s().addExtractionWorkflow('missing')).toBeNull();
+    expect(s().addExtractionWorkflow(s().addNode('image', { x: 0, y: 0 }))).toBeNull();
+    const lonely = s().addNode('extract', { x: 0, y: 600 });
+    expect(s().addExtractionWorkflow(lonely)).toBeNull(); // nothing found yet
+
+    const { ex, src } = found([0, 1, 2]);
+    expect(s().addExtractionWorkflow(ex)).toBeNull(); // all unticked
+
+    s().updateNodeData(ex, { off: [] });
+    const made = s().addExtractionWorkflow(ex)!;
+    s().updateNodeData(made.collection, { locked: true });
+    expect(s().addExtractionWorkflow(ex)).toBeNull();
+    expect(s().toast?.tone).toBe('error');
+
+    s().updateNodeData(src, { assetId: 'another' }); // the image changed: the search is stale
+    s().updateNodeData(made.collection, { locked: false });
+    expect(s().addExtractionWorkflow(ex)).toBeNull();
+  });
+
+  it('the Assets port only reaches an Input Collection, never a Generate node directly', () => {
+    const { ex } = found();
+    const g = s().addNode('generate', { x: 600, y: 0 });
+    s().connect({ source: ex, sourceHandle: OUT, target: g, targetHandle: 'original' });
+    expect(s().edges.some((e) => e.target === g)).toBe(false);
+    expect(s().toast?.tone).toBe('error');
+    const outCol = s().addNode('collection', { x: 600, y: 300 }, { role: 'output' });
+    s().connect({ source: ex, sourceHandle: OUT, target: outCol, targetHandle: 'extract' });
+    expect(s().edges.some((e) => e.target === outCol)).toBe(false); // an Output Collection hides that port
+  });
+
+  it('deleting the image empties every slot that listed it', () => {
+    const { ex } = found();
+    const made = s().addExtractionWorkflow(ex)!;
+    expect(s().clearAssetRefs(['screen'])).toBe(4); // 3 list items + the source Image node
+    expect(itemsOf(made.collection)).toHaveLength(0);
+  });
+});
+
 describe('one-connection ports', () => {
   it('a new connection replaces the old one, in one undo step', () => {
     const a = s().addNode('palette', { x: 0, y: 0 });

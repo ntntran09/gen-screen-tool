@@ -90,7 +90,6 @@ function Workspace() {
     async (id: string) => {
       const project = projects.find((p) => p.id === id);
       const name = project?.name ?? 'this project';
-      if (!window.confirm(`Delete "${name}"?\n\nIts files are moved to the workspace backups folder, not erased.`)) return;
       const current = useGraphStore.getState().projectId === id;
       await api.deleteProject(id);
       const list = await refreshProjects();

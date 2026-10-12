@@ -14,7 +14,7 @@ from .config import Settings
 from .db import migrate
 from .generation.engine import GenerationEngine
 from .providers import build_registry
-from .routers import assets, auth, generations, projects, providers
+from .routers import assets, auth, detect, generations, projects, providers
 from .security import CSRF_HEADER, LocalGuardMiddleware
 
 
@@ -77,6 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(assets.router)
     app.include_router(providers.router)
     app.include_router(generations.router)
+    app.include_router(detect.router)
     return app
 
 

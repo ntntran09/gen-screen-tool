@@ -28,8 +28,13 @@ class Settings:
     max_import_bytes: int = int(os.environ.get("NODECANVAS_MAX_IMPORT_MB", "25")) * 1024 * 1024
     max_import_files: int = int(os.environ.get("NODECANVAS_MAX_IMPORT_FILES", "200"))
     # App limit on images attached to one request (original + themes + references). The Codex
-    # backend's real limit is unverified, so this is ours, not the provider's (spec ง14.5).
+    # backend's real limit is unverified, so this is ours, not the provider's (spec ยง14.5).
     max_input_images: int = int(os.environ.get("NODECANVAS_MAX_INPUT_IMAGES", "16"))
+    # Small chat models that look at an image to find assets, in order of preference (first one the
+    # account accepts wins). "luna" is the fast, cheap tier in the Codex model list.
+    vision_models: tuple[str, ...] = tuple(
+        m.strip() for m in os.environ.get("NODECANVAS_VISION_MODEL", "gpt-6-luna,gpt-5.6-luna").split(",") if m.strip()
+    )
     host: str = os.environ.get("NODECANVAS_HOST", "127.0.0.1")
     port: int = int(os.environ.get("NODECANVAS_PORT", "8787"))
     frontend_origins: tuple[str, ...] = tuple(

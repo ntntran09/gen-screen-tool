@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { uuid } from '../lib/uuid';
 import { estimateTasks, referencedBatchIds } from '../graph/generation';
 import {
   api,
@@ -159,9 +160,9 @@ export const useGenerationStore = create<GenerationState>()((set, get) => {
       set((s) => ({ starting: { ...s.starting, [generateId]: true } }));
       // The node that receives the results is placed and saved before the batch exists, so a
       // reload or crash right after pressing Generate cannot orphan the results.
-      const batchId = crypto.randomUUID();
-      g.placeResultNode(generateId, batchId, estimateTasks(g.nodes, g.edges, generateId));
+      const batchId = uuid();
       try {
+        g.placeResultNode(generateId, batchId, estimateTasks(g.nodes, g.edges, generateId));
         const placed = useGraphStore.getState();
         // The graph exactly as shown becomes the batch's immutable snapshot (spec §13.1).
         const graph = toGraphPayload(placed.nodes, placed.edges, placed.viewport);

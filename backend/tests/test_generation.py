@@ -521,3 +521,73 @@ def test_palette_image_port_is_valid_and_single() -> None:
     assert plan(graph(base, edges)).tasks  # an image feeding a palette is fine
     errs = errors_of(graph(base, [*edges, edge("i2", "pal", "image")]))
     assert any("accepts only one connection" in e for e in errs)
+
+
+def test_manual_count_sends_every_original_with_the_primary_first() -> None:
+    nodes = [gen(primaryOriginalNodeId="o2"), prompt(), node("o1", "image", assetId="a1", notes="", preserve={}, instructions="", roles=[]),
+             node("o2", "image", assetId="a2", notes="", preserve={}, instructions="", roles=[]), collection("c", "a3")]
+    edges = [edge("p", "g", "prompt"), edge("o1", "g", "original"), edge("o2", "g", "original"), edge("c", "g", "original")]
+    task = plan(graph(nodes, edges)).tasks[0]
+    assert task.original_asset_id == "a2"  # the primary
+    assert task.extra_original_asset_ids == ["a1", "a3"]  # the rest, in connection order, collection items included
+    assert "Additional originals: attached images 2–3 are also provided as original assets" in task.prompt
+
+    # Match inputs: one original per task, so nothing extra.
+    nodes[0] = gen(mode="match")
+    assert all(not t.extra_original_asset_ids for t in plan(graph(nodes, edges)).tasks)
+    # They count towards the image limit.
+    nodes[0] = gen(primaryOriginalNodeId="o2")
+    assert any("at most 2" in e for e in errors_of(graph(nodes, edges), max_images=2))  # primary + 2 extras = 3 images
+
+
+def test_extra_originals_reach_the_provider_in_prompt_order(ctx) -> None:
+    c, pid, fake, _ = ctx
+    ids = import_assets(c, pid, "main.png", "other.png")
+    img = lambda i, a: node(i, "image", assetId=a, notes="", preserve={}, instructions="", roles=[])  # noqa: E731
+    g = graph([gen(primaryOriginalNodeId="m"), prompt(), img("m", ids[0]), img("x", ids[1])],
+              [edge("p", "g", "prompt"), edge("x", "g", "original"), edge("m", "g", "original")])
+    wait(c, start(c, pid, g).json()["batch"]["id"])
+    request = fake.calls[0][1]
+    assert request.original_image == png("red")
+    assert len(request.reference_images) == 1  # the extra original follows the primary
+
+
+def test_game_screen_without_an_original_is_refused() -> None:
+    g = graph([gen(), prompt(assetCategory="Game Screen")], [edge("p", "g", "prompt")])
+    assert any("Game Screen needs an original image" in e for e in errors_of(g))
+
+
+def test_extract_node_fills_an_input_collection_and_cannot_feed_generate_directly() -> None:
+    src = node("src", "image", assetId="t1", notes="", preserve={}, instructions="", roles=[])
+    col = collection("c", "a1", "a2", "a3", disabled=("a2",), overrides={"a1": "the left one"})
+    chain = graph([gen(mode="match"), prompt("Redraw {asset_name}"), src, node("x", "extract", hint="", detections=None, off=[]), col],
+                  [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("x", "c", "extract"), edge("c", "g", "original")])
+    p = plan(chain)
+    assert [(t.original_asset_id, t.source.name) for t in p.tasks] == [("a1", "flower_01"), ("a3", "flower_03")]
+    assert "For this asset: the left one" in p.tasks[0].prompt
+
+    # Straight into Generate is not a valid connection: the cut-outs live in the collection.
+    direct = graph([gen(), prompt(), src, node("x", "extract", hint="", detections=None, off=[])],
+                   [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("x", "g", "original")])
+    assert any("cannot connect to the original port" in e for e in errors_of(direct))
+    # Only an Input Collection takes extracted assets; the Extract node takes exactly one image.
+    out_col = node("c", "collection", role="output", description="", items=[])
+    wrong = graph([gen(), prompt(), src, node("x", "extract"), out_col], [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("x", "c", "extract")])
+    assert any("Extracted assets can only go to an Input Collection" in e for e in errors_of(wrong))
+    two = graph([gen(), prompt(), src, node("src2", "image", assetId="a1", notes="", preserve={}, instructions="", roles=[]), node("x", "extract")],
+                [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("src2", "x", "image")])
+    assert any("accepts only one connection" in e for e in errors_of(two))
+
+
+def test_a_collection_item_label_names_the_task_so_one_image_can_be_redrawn_per_asset() -> None:
+    items = [
+        {"id": "i0", "assetId": "a1", "enabled": True, "label": "blue pot", "promptOverride": "the pot at the top left"},
+        {"id": "i1", "assetId": "a1", "enabled": True, "label": "pause button", "promptOverride": "the round button"},
+        {"id": "i2", "assetId": "a1", "enabled": True, "promptOverride": ""},  # no label: the image name
+    ]
+    col = node("c", "collection", role="input", description="", items=items)
+    p = plan(graph([gen(mode="match"), prompt("Redraw the {asset_name}"), col], [edge("p", "g", "prompt"), edge("c", "g", "original")]))
+    assert [t.source.name for t in p.tasks] == ["blue pot", "pause button", "flower_01"]
+    assert p.tasks[0].prompt.startswith("Redraw the blue pot")
+    assert "For this asset: the pot at the top left" in p.tasks[0].prompt
+    assert all(t.original_asset_id == "a1" for t in p.tasks)  # always the full original image

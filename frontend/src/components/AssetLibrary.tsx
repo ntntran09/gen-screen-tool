@@ -78,12 +78,6 @@ export function AssetLibrary() {
 
   const remove = async () => {
     const ids = selectedAssets.map((a) => a.id);
-    const inUse = ids.reduce((n, id) => n + (used.get(id) ?? 0), 0);
-    const what = ids.length === 1 ? `"${selectedAssets[0].name}"` : `${ids.length} images`;
-    const note = inUse
-      ? `\n\n${inUse} place(s) on the canvas use them; those nodes and collection items will be emptied (Ctrl+Z restores the canvas, not the files).`
-      : '';
-    if (!window.confirm(`Delete ${what} from the library?${note}\n\nFiles are moved to the workspace backups folder, not erased.`)) return;
     const graph = useGraphStore.getState();
     try {
       const deleted = await useAssetStore.getState().remove(ids);

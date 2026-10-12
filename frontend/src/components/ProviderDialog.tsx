@@ -1,3 +1,4 @@
+import { copyText } from '../lib/clipboard';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api, ApiError, type AuthStatus, type ProviderTestResult } from '../lib/api';
@@ -151,7 +152,7 @@ export function ProviderDialog({ onClose, onChanged }: { onClose: () => void; on
                 <code className="flex-1 rounded-lg border-2 border-outline bg-node px-3 py-2 text-center font-mono text-[20px] tracking-[0.2em] text-ink">
                   {status.pending.user_code}
                 </code>
-                <Button onClick={() => void navigator.clipboard.writeText(status.pending!.user_code)}>Copy</Button>
+                <Button onClick={() => void copyText(status.pending!.user_code)}>Copy</Button>
               </div>
               <a
                 href={status.pending.verification_url}
