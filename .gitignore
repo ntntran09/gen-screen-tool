@@ -1,0 +1,14 @@
+# Local workspace data (projects, images, SQLite database)
+workspace/
+
+# Tooling caches
+.cache/
+backend/.venv/
+backend/.pytest_cache/
+**/__pycache__/
+frontend/node_modules/
+frontend/dist/
+
+# Never commit credentials
+*.env
+.env*

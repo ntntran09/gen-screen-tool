@@ -1,0 +1,171 @@
+"""SQLite access and schema migrations (spec §21)."""
+
+from __future__ import annotations
+
+import shutil
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+
+MIGRATIONS: list[tuple[int, str]] = [
+    (
+        1,
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            viewport_json TEXT NOT NULL DEFAULT '{"x":0,"y":0,"zoom":1}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            type TEXT NOT NULL,
+            position_json TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_nodes_project ON nodes(project_id);
+        CREATE TABLE edges (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            source_handle TEXT,
+            target_node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            target_handle TEXT
+        );
+        CREATE INDEX idx_edges_project ON edges(project_id);
+        CREATE TABLE assets (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            original_filename TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            file_size INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE collections (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            collection_type TEXT NOT NULL CHECK (collection_type IN ('input','output')),
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE collection_items (
+            id TEXT PRIMARY KEY,
+            collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+            asset_id TEXT NOT NULL REFERENCES assets(id),
+            sort_index INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            prompt_override TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE generation_batches (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            generate_node_id TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            expected_count INTEGER NOT NULL,
+            completed_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE TABLE generation_tasks (
+            id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL REFERENCES generation_batches(id) ON DELETE CASCADE,
+            source_asset_id TEXT,
+            variant_index INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            prompt_snapshot TEXT NOT NULL,
+            provider_request_json TEXT NOT NULL,
+            output_asset_id TEXT REFERENCES assets(id),
+            error_code TEXT,
+            error_message TEXT,
+            attempt_number INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE TABLE app_settings (
+            key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL
+        );
+        """,
+    ),
+    (
+        2,
+        """
+        ALTER TABLE assets ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
+        ALTER TABLE assets ADD COLUMN thumbnail_path TEXT;
+        UPDATE assets SET display_name = original_filename WHERE display_name = '';
+        CREATE INDEX idx_assets_project ON assets(project_id);
+        """,
+    ),
+]
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def connect(path: Path) -> sqlite3.Connection:
+    # One connection per request, used sequentially; async routes may touch it from a worker thread.
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)  # explicit `transaction()`
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
+
+
+def migrate(db_path: Path, backups_dir: Path) -> None:
+    """Apply pending migrations. Backs up an existing database first (spec §27.4)."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    existed = db_path.exists()
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
+        pending = [(v, sql) for v, sql in MIGRATIONS if v not in applied]
+        if not pending:
+            return
+        if existed:
+            backups_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            shutil.copy2(db_path, backups_dir / f"database-{stamp}-pre-v{pending[0][0]}.sqlite")
+        for version, sql in pending:
+            try:
+                conn.executescript(
+                    f"BEGIN;\n{sql}\nINSERT INTO schema_migrations VALUES ({version}, '{now_iso()}');\nCOMMIT;"
+                )
+            except sqlite3.Error:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+    finally:
+        conn.close()
