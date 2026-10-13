@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import tempfile
+import zipfile
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
@@ -14,6 +17,7 @@ from .. import assets as svc
 from ..config import Settings
 from ..deps import get_conn, get_settings
 from ..errors import ApiError
+from ..generation.prompt_parts import split_prompt
 
 router = APIRouter(tags=["assets"])
 
@@ -74,6 +78,43 @@ async def import_assets(
 def list_project_assets(project_id: str, conn: Conn, settings: Cfg) -> list[dict[str, Any]]:
     _require_project(conn, project_id)
     return svc.list_assets(conn, settings, project_id)
+
+
+@router.get("/api/projects/{project_id}/assets/download")
+def download_selected(project_id: str, conn: Conn, settings: Cfg,
+                      ids: Annotated[list[str], Query(min_length=1, max_length=200)]) -> StreamingResponse:
+    _require_project(conn, project_id)
+    files = []
+    try:
+        for asset_id in dict.fromkeys(ids):
+            row = svc.get_asset_row(conn, asset_id)
+            if row["project_id"] != project_id:
+                raise ApiError(404, "NOT_FOUND", "Image not found in this project.")
+            files.append((row, svc.asset_file(settings, row)))
+    except svc.AssetError as exc:
+        _raise(exc)
+    archive = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024)
+    try:
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as zip_file:
+            for index, (row, path) in enumerate(files, 1):
+                name = svc.sanitize_display_name(row["display_name"] or row["original_filename"])
+                if not name.lower().endswith(path.suffix.lower()):
+                    name += path.suffix
+                zip_file.write(path, f"{index:03d}_{name}")
+        archive.seek(0)
+    except BaseException:
+        archive.close()
+        raise
+
+    def chunks():
+        try:
+            while chunk := archive.read(READ_CHUNK):
+                yield chunk
+        finally:
+            archive.close()
+
+    return StreamingResponse(chunks(), media_type="application/zip",
+                             headers={"Content-Disposition": 'attachment; filename="selected-images.zip"'})
 
 
 @router.get("/api/assets/{asset_id}")
@@ -139,6 +180,34 @@ def asset_palette(asset_id: str, conn: Conn, settings: Cfg, count: int = 5) -> d
     except svc.AssetError as exc:
         _raise(exc)
         raise
+
+
+@router.get("/api/assets/{asset_id}/origin-prompt")
+def asset_origin_prompt(asset_id: str, conn: Conn) -> dict[str, Any]:
+    """The request that made a generated image, oldest first, so later steps know the intended theme.
+
+    A retry or edit only holds the change that was asked for, so the chain is followed back to the
+    request that created the original. Images that were not generated return an empty list.
+    """
+    prompts: list[str] = []
+    current: str | None = asset_id
+    for _ in range(6):
+        row = conn.execute(
+            "SELECT prompt_snapshot, provider_request_json FROM generation_tasks"
+            " WHERE output_asset_id = ? AND status = 'completed' ORDER BY finished_at DESC LIMIT 1",
+            (current,),
+        ).fetchone()
+        if row is None:
+            break
+        request = json.loads(row["provider_request_json"])
+        settings = request.get("settings", {})
+        text = split_prompt(row["prompt_snapshot"], settings)["user_prompt"].strip()
+        if text:
+            prompts.insert(0, text)
+        current = request.get("original_asset_id") if settings.get("preset") == "result_edit" else None
+        if current is None:
+            break
+    return {"prompts": prompts}
 
 
 class AssetPatch(BaseModel):

@@ -1,40 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { assetPrompt, currentDetections, gridPositions, locationPhrase, sourceAssetFor, uniqueNames } from './detect';
+import { currentDetections, selectionFromDetections, sourceAssetFor } from './detect';
 import type { CanvasEdge, CanvasNode, ExtractData } from './types';
 
-describe('detect helpers', () => {
-  it('numbers repeated names, ignoring case, and never returns an empty name', () => {
-    expect(uniqueNames(['blue pot', 'Blue Pot', 'button', 'blue pot', '  '])).toEqual(['blue pot', 'Blue Pot 2', 'button', 'blue pot 3', 'asset']);
-  });
-
-  it('lays nodes out in a grid from the origin', () => {
-    expect(gridPositions({ x: 10, y: 20 }, 5, 2, 100, 50)).toEqual([
-      { x: 10, y: 20 },
-      { x: 110, y: 20 },
-      { x: 10, y: 70 },
-      { x: 110, y: 70 },
-      { x: 10, y: 120 },
-    ]);
-  });
-});
-
-describe('where an asset is', () => {
-  const at = (x: number, y: number, w = 0.1, h = 0.1) => ({ x, y, w, h });
-
-  it('names the third of the image its centre falls in, with rough percentages', () => {
-    expect(locationPhrase(at(0.05, 0.05))).toBe('top left (about 5-15% across, 5-15% down)');
-    expect(locationPhrase(at(0.45, 0.45))).toBe('center (about 45-55% across, 45-55% down)');
-    expect(locationPhrase(at(0.85, 0.9))).toBe('bottom right (about 85-95% across, 90-100% down)');
-    expect(locationPhrase(at(0.45, 0.05))).toContain('top center');
-    expect(locationPhrase(at(0.9, 0.5, 0.5, 0.5))).toContain('100% across'); // never past the image edge
-  });
-
-  it('asks for exactly one asset, by name, description and place, without placeholder braces', () => {
-    const text = assetPrompt({ name: 'blue {asset_name} pot', description: '  a  pot ', ...at(0.1, 0.1) });
-    expect(text).toContain('"blue asset_name pot" (a pot)');
-    expect(text).toContain('ONLY this one asset');
-    expect(text).toContain('top left');
-    expect(assetPrompt({ name: 'cat', description: '', ...at(0, 0.8) })).toContain('"cat". It is in');
+describe('asset sheet selection', () => {
+  it('skips unticked and empty names, strips braces, and lists each name once ignoring case', () => {
+    const names = [' blue  pot ', 'Blue Pot', '{cat}', 'button', ' ', 'cat'];
+    expect(selectionFromDetections(names.map((name) => ({ name })), [3])).toBe('blue pot, cat');
+    expect(selectionFromDetections([{ name: 'cat' }], [0])).toBe('');
   });
 });
 

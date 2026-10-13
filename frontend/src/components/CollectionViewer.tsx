@@ -8,6 +8,9 @@ import { useAssetStore } from '../store/assetStore';
 import { useGraphStore } from '../store/graphStore';
 import { ASSET_DRAG_MIME } from './Canvas';
 import { MiniThumb } from './AssetThumb';
+import { assetUrls } from '../lib/api';
+import { isRunning, latestAttempts, useGenerationStore } from '../store/generationStore';
+import { OutputActions } from './OutputActions';
 
 const ITEM_DRAG_MIME = 'application/x-nodecanvas-collection-item';
 
@@ -28,6 +31,9 @@ function ItemCard({
   dropHint,
   onDragOverCard,
   onDropCard,
+  selected,
+  onSelect,
+  outputActions,
 }: {
   item: CollectionItem;
   index: number;
@@ -40,6 +46,9 @@ function ItemCard({
   dropHint: boolean;
   onDragOverCard: (e: DragEvent) => void;
   onDropCard: (e: DragEvent) => void;
+  selected: boolean;
+  onSelect: () => void;
+  outputActions?: React.ReactNode;
 }) {
   const asset = useAssetStore((s) => s.assets[item.assetId]);
   return (
@@ -55,10 +64,12 @@ function ItemCard({
       onDragOver={onDragOverCard}
       onDrop={onDropCard}
     >
+      {outputActions}
       <div className="mb-1.5 flex items-center gap-1.5">
+        <input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Select image ${index + 1}`} />
         <span className="rounded bg-panel-2 px-1.5 font-mono text-[10px] text-ink-2">{index + 1}</span>
-        <span className="min-w-0 flex-1 truncate text-[11px] text-ink" title={item.label || asset?.name}>
-          {item.label || asset?.name || 'Unknown image'}
+        <span className="min-w-0 flex-1 truncate text-[11px] text-ink" title={asset?.name}>
+          {asset?.name ?? 'Unknown image'}
         </span>
         <label className="flex items-center gap-1 text-[11px] text-ink-2" title="Disabled images are skipped by generation">
           <input
@@ -119,6 +130,9 @@ export function CollectionViewer() {
   const setItems = useGraphStore((s) => s.setCollectionItems);
   const importImages = useImageImport();
   const [dropIndex, setDropIndex] = useState<number | null>(null);
+  const [selection, setSelection] = useState<{ nodeId: string; ids: string[] }>({ nodeId: '', ids: [] });
+  const generationTasks = useGenerationStore((s) => s.tasks);
+  const projectId = useGraphStore((s) => s.projectId);
   const closeRef = useRef<HTMLButtonElement>(null);
   const close = () => useAssetStore.getState().openViewer(null);
 
@@ -150,6 +164,10 @@ export function CollectionViewer() {
   const readOnly = data.locked;
   const canAdd = !readOnly && data.role === 'input';
   const enabled = items.filter((i) => i.enabled).length;
+  const selectedIds = selection.nodeId === node.id ? selection.ids : [];
+  const selectedItems = items.filter((i) => selectedIds.includes(i.id));
+  const select = (ids: string[]) => setSelection({ nodeId: node.id, ids });
+  const outputTasks = (data.batchIds ?? []).flatMap((id) => generationTasks[id] ?? []);
 
   const update = (next: CollectionItem[], key?: string) => setItems(node.id, next, key);
   const patchItem = (id: string, patch: Partial<CollectionItem>, key?: string) =>
@@ -243,6 +261,16 @@ export function CollectionViewer() {
           </button>
         </header>
 
+        <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2">
+          <button type="button" className={headerBtn} onClick={() => select(items.map((i) => i.id))} disabled={!items.length}>Select all</button>
+          <button type="button" className={headerBtn} onClick={() => select([])} disabled={!selectedItems.length}>Clear selection</button>
+          <span className="text-[12px] text-ink-2">{selectedItems.length} selected</span>
+          {projectId && selectedItems.length > 0 && <a className={headerBtn}
+            href={assetUrls.selected(projectId, selectedItems.map((i) => i.assetId))}>Download Selected</a>}
+          {data.role === 'output' && <button type="button" className={headerBtn} disabled={readOnly || !selectedItems.length}
+            onClick={() => useGraphStore.getState().expandCollection(node.id, selectedIds)}>Expand selected to nodes</button>}
+        </div>
+
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
           {items.length === 0 ? (
             <div className="flex h-full min-h-60 flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-line-strong text-center text-[13px] text-ink-3">
@@ -264,18 +292,45 @@ export function CollectionViewer() {
                   dropHint={dropIndex === i}
                   onDragOverCard={(e) => onDragOver(e, i)}
                   onDropCard={(e) => onDrop(e, i)}
+                  selected={selectedIds.includes(item.id)}
+                  onSelect={() => select(selectedIds.includes(item.id) ? selectedIds.filter((id) => id !== item.id) : [...selectedIds, item.id])}
+                  outputActions={data.role === 'output' && !readOnly ? (() => {
+                    const task = outputTasks.find((t) => t.output_asset_id === item.assetId);
+                    return <OutputActions key={item.assetId} nodeId={node.id} assetId={item.assetId} batchId={task?.batch_id} taskId={task?.id} />;
+                  })() : undefined}
                 />
               ))}
             </ul>
           )}
+          {data.role === 'output' && (data.batchIds ?? []).map((id) => <FailedItems key={id} batchId={id} readOnly={readOnly} />)}
         </div>
 
-        <footer className="border-t border-line px-4 py-2 text-[11px] text-ink-3">
-          Drag cards to reorder. Disabled images stay in the collection but are skipped when generating. Removing an image
-          never deletes its file.
-        </footer>
+
       </div>
     </div>,
     document.body,
   );
+}
+
+function FailedItems({ batchId, readOnly }: { batchId: string; readOnly: boolean }) {
+  const tasks = useGenerationStore((s) => s.tasks[batchId]);
+  const batch = useGenerationStore((s) => s.batches[batchId]);
+  const [pending, setPending] = useState(false);
+  useEffect(() => {
+    if (!tasks) void useGenerationStore.getState().loadTasks(batchId).catch((err: Error) =>
+      useGraphStore.getState().showToast(err.message, 'error'));
+  }, [batchId, tasks]);
+  const failed = latestAttempts(tasks).filter((t) => t.status === 'failed' || t.status === 'interrupted');
+  if (!failed.length) return null;
+  return <section aria-label="Failed images" className="mt-4 border-t border-line pt-3">
+    <h3 className="mb-2 text-[13px] font-semibold">Failed images</h3>
+    <ul className="space-y-2">{failed.map((task) => <li key={task.id} className="flex flex-wrap items-center gap-2 text-[12px]">
+      <span className="font-medium">{task.source_name ?? `Image ${task.slot_index + 1}`} v{task.variant_index}</span>
+      <span className="text-danger">{task.error_message ?? task.error_code}</span>
+      <button type="button" className={headerBtn} disabled={readOnly || pending || isRunning(batch)} onClick={async () => {
+        setPending(true);
+        try { await useGenerationStore.getState().retry(batchId, [task.id]); } finally { setPending(false); }
+      }}>Retry image</button>
+    </li>)}</ul>
+  </section>;
 }

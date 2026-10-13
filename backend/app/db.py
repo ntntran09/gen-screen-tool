@@ -136,6 +136,18 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE assets ADD COLUMN deleted_at TEXT;
         """,
     ),
+    (
+        5,
+        """
+        ALTER TABLE projects ADD COLUMN graph_revision INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE sync_clients (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            client_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            PRIMARY KEY (project_id, client_id)
+        );
+        """,
+    ),
 ]
 
 

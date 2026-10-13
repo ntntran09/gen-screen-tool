@@ -1,6 +1,6 @@
 import type { Edge, Node } from '@xyflow/react';
 
-export type NodeKind = 'prompt' | 'image' | 'palette' | 'collection' | 'extract' | 'generate' | 'output';
+export type NodeKind = 'prompt' | 'image' | 'palette' | 'collection' | 'extract' | 'generate' | 'output' | 'text' | 'drawing';
 
 /** Older saved projects had separate Original / Theme image nodes; they load as `image`. */
 export const LEGACY_IMAGE_KINDS = ['original', 'theme'] as const;
@@ -9,49 +9,27 @@ export const LEGACY_IMAGE_KINDS = ['original', 'theme'] as const;
  * Value types that flow along edges (spec §25.1). `original` and `theme` are only port
  * colours now: every image node outputs `image`, and its role comes from the port it feeds.
  */
-export type PortType = 'prompt' | 'image' | 'original' | 'theme' | 'palette' | 'assetList' | 'extracted' | 'generated';
+export type PortType = 'prompt' | 'image' | 'original' | 'theme' | 'palette' | 'assetList' | 'generated' | 'extracted';
 
 export interface BaseNodeData {
   title: string;
   collapsed: boolean;
   locked: boolean;
+  inlineGeneration?: {
+    id: string;
+    assetId: string;
+    prompt: string;
+    settings: Partial<GenerateData>;
+    batchIds: string[];
+  };
   [key: string]: unknown;
 }
 
-/** Game-asset settings travel with the prompt (the first prompt feeding a Generate node decides). */
-export const GAME_ASSET_KEYS = [
-  'assetCategory',
-  'artStyle',
-  'preserveSubject',
-  'preserveSilhouette',
-  'consistentFraming',
-  'consistentScale',
-] as const;
-
+/** The user request that fills the chosen preset's template (the art direction notes can go here too). */
 export interface PromptData extends BaseNodeData {
   text: string;
-  constraints: string;
   enabled: boolean;
-  role: 'main' | 'style' | 'constraints' | 'output';
-  order: number;
-  assetCategory: (typeof ASSET_CATEGORIES)[number];
-  artStyle: string;
-  preserveSubject: boolean;
-  preserveSilhouette: boolean;
-  consistentFraming: boolean;
-  consistentScale: boolean;
 }
-
-
-export const PRESERVATION_OPTIONS = [
-  'composition',
-  'shape',
-  'proportions',
-  'silhouette',
-  'mainSubject',
-  'objectCount',
-] as const;
-export type Preservation = (typeof PRESERVATION_OPTIONS)[number];
 
 export const THEME_ROLES = ['artStyle', 'lighting', 'shading', 'material', 'mood', 'composition', 'texture'] as const;
 export type ThemeRole = (typeof THEME_ROLES)[number];
@@ -73,9 +51,6 @@ export interface DetectedAsset {
 export interface ImageData extends BaseNodeData {
   assetId: string | null;
   notes: string;
-  /** Used when connected to an Original port. */
-  preserve: Record<Preservation, boolean>;
-  instructions: string;
   /** Used when connected to a Theme port. */
   roles: ThemeRole[];
 }
@@ -105,8 +80,6 @@ export interface CollectionItem {
   enabled: boolean;
   /** Extra prompt text used only for this image (spec "per-asset prompt override"). */
   promptOverride: string;
-  /** Names this item instead of the image's file name (one image can be listed once per asset to redraw). */
-  label?: string;
 }
 
 export interface CollectionData extends BaseNodeData {
@@ -123,59 +96,70 @@ export interface CollectionData extends BaseNodeData {
 /** `match` = closest preset to the original image's shape (resolved per task by the backend). */
 export const ASPECT_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9', 'match'] as const;
 export const aspectLabel = (a: string) => (a === 'match' ? 'Match original' : a);
-/** A whole game screen, re-themed with the same gameplay and layout. */
-export const GAME_SCREEN = 'Game Screen';
-export const ASSET_CATEGORIES = [
-  'Game Screen',
-  'Character',
-  'Environment',
-  'Prop',
-  'Item',
-  'Icon',
-  'UI Element',
-  'Decoration',
-  'Background',
-  'Concept Art',
-  'Other',
-] as const;
 
-/**
- * Extract Assets: finds the separate assets in the connected image with a small ChatGPT model and marks
- * where they are. "Redraw nodes" then builds a collection that lists the original image once per asset
- * (each with its own instruction) plus a Prompt and a Generate that redraw them.
- */
+/** The only two prompt presets. The wording lives in the backend (`generation/presets.py`). */
+export const PRESETS = [
+  {
+    id: 'screen',
+    label: 'Game screen restyle',
+    description: 'Restyle the whole screen from the user request; gameplay, layout and HUD stay the same.',
+  },
+  {
+    id: 'assets',
+    label: 'Asset sheet',
+    description: 'Create a clean sheet of the gameplay assets in the image, in the requested style, on a transparent background.',
+  },
+] as const;
+export type PresetId = (typeof PRESETS)[number]['id'];
+
+/** Find boxes; Build asset sheet crops selected assets into a collection and adds background removal. */
 export interface ExtractData extends BaseNodeData {
   hint: string;
+  /** Vision model used to find assets; empty uses the server default. Reasoning effort is fixed at low. */
+  model?: string;
   /** Result of the last search, for the image it was run on (ignored once that image changes). */
   detections: { assetId: string; model: string | null; seconds: number; items: DetectedAsset[] } | null;
   /** Indexes of detections the user unticked. */
   off: number[];
+  /** The Generate node built from this search, so pressing the button again updates it instead of adding one. */
+  generateNodeId: string | null;
+  collectionNodeId: string | null;
 }
 
 export interface GenerateData extends BaseNodeData {
   providerId: string;
   model: string;
+  preset: PresetId;
+  /** Regenerate edits the connected result, without a restyle/asset-sheet template. */
+  editResult?: boolean;
+  /** Asset sheet preset: which assets to create ("pots, ice and number badges"); empty = let the AI decide. */
+  assetSelection: string;
   mode: 'manual' | 'match';
   outputCount: number;
   variantsPerInput: number;
   aspectRatio: (typeof ASPECT_RATIOS)[number];
   quality: 'auto' | 'low' | 'medium' | 'high';
   outputFormat: 'png' | 'webp' | 'jpg';
-  background: 'white' | 'solid' | 'transparent' | 'custom';
-  backgroundValue: string;
   /** Required in Manual Count mode when several originals are connected (spec §12.1 A3). */
   primaryOriginalNodeId: string | null;
 }
 
 export interface OutputData extends BaseNodeData {
+  sourceNodeId?: string;
+  resultAction?: 'retry' | 'variation';
   assetId: string | null;
   /** Batch that produced (or will produce) this result. */
   generationId: string | null;
   /** Task whose output was placed here. */
   taskId: string | null;
+  /** A regenerated result waits for this slot and attempt, ignoring older outputs. */
+  pendingSlot?: number;
+  pendingAttempt?: number;
 }
 
 export interface NodeDataByKind {
+  text: BaseNodeData & { text: string; color: string; fontSize: number; comment: boolean };
+  drawing: BaseNodeData & { points: { x: number; y: number }[]; color: string; strokeWidth: number; canvasWidth: number; canvasHeight: number };
   prompt: PromptData;
   image: ImageData;
   palette: PaletteData;

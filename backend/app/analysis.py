@@ -1,7 +1,7 @@
 """Find the separate assets in an image with a small chat model.
 
-The model only answers in text (a JSON list of names, descriptions and rough boxes). The boxes say where
-an asset is; they are not used to cut pixels out, because they are approximate.
+The model answers with names, descriptions and approximate boxes for each separate visual asset.
+Build asset sheet later crops these boxes and uses the target descriptions for isolation.
 """
 
 from __future__ import annotations

@@ -60,11 +60,9 @@ export function checkConnection(
   if (source.type === 'collection' && (source.data as CollectionData).role !== 'input') {
     return { ok: false, reason: 'Only an Input Collection can feed a Generate node.' };
   }
-  if (target.type === 'collection' && conn.targetHandle === 'in' && (target.data as CollectionData).role !== 'output') {
-    return { ok: false, reason: 'Generated results can only go to an Output Collection.' };
-  }
-  if (target.type === 'collection' && conn.targetHandle === 'extract' && (target.data as CollectionData).role !== 'input') {
-    return { ok: false, reason: 'Extracted assets can only go to an Input Collection.' };
+  if (target.type === 'collection') {
+    const role = conn.targetHandle === 'extract' ? 'input' : 'output';
+    if ((target.data as CollectionData).role !== role) return { ok: false, reason: `This connection needs an ${role} collection.` };
   }
 
   const existing = edges.filter(

@@ -1,9 +1,9 @@
-import { Handle, Position, useNodeConnections, type NodeProps } from '@xyflow/react';
-import { memo, type ReactNode } from 'react';
-import { generateNeedsOriginal } from '../graph/generation';
+import { Handle, Position, useNodeConnections, useUpdateNodeInternals, type NodeProps } from '@xyflow/react';
+import { memo, useEffect, type ReactNode } from 'react';
 import { getDefinition, isPortRequired, type InputPort, type OutputPort } from '../graph/registry';
 import type { CanvasNode, PortType } from '../graph/types';
 import { NodeIcon } from '../components/NodeIcon';
+import { GenerateSymbol } from '../components/InlineGenerationControl';
 import { isNodeFrozen, useGraphStore } from '../store/graphStore';
 
 const portColor = (type: PortType) => `var(--color-port-${type})`;
@@ -14,11 +14,13 @@ function PortHandle({
   id,
   portType,
   title,
+  symbol = false,
 }: {
   type: 'source' | 'target';
   id: string;
   portType: PortType;
   title?: string;
+  symbol?: boolean;
 }) {
   const connected = useNodeConnections({ handleType: type, handleId: id }).length > 0;
   return (
@@ -27,9 +29,13 @@ function PortHandle({
       position={type === 'target' ? Position.Left : Position.Right}
       id={id}
       title={title}
+      aria-label={title}
+      className={symbol ? 'inline-generation-handle' : undefined}
       data-connected={connected || undefined}
-      style={{ background: connected ? portColor(portType) : 'var(--color-node)' }}
-    />
+      style={{ background: symbol ? `linear-gradient(135deg, color-mix(in srgb, ${getDefinition('prompt').color} 16%, white), color-mix(in srgb, ${getDefinition('generate').color} 16%, white))` : connected ? portColor(portType) : 'var(--color-node)' }}
+    >
+      {symbol && <GenerateSymbol />}
+    </Handle>
   );
 }
 
@@ -66,12 +72,12 @@ function InputRow({ port, required }: { port: InputPort; required: boolean }) {
   );
 }
 
-function OutputRow({ port }: { port: OutputPort }) {
+function OutputRow({ port, symbol }: { port: OutputPort; symbol?: boolean }) {
   const count = useConnectionCount('source', port.id);
   return (
-    <div className={`relative flex h-6 items-center justify-end pr-3 text-[11px] ${count ? 'font-semibold text-ink' : 'text-ink-2'}`}>
+    <div className={`relative flex h-6 items-center justify-end ${symbol ? 'pr-5' : 'pr-3'} text-[11px] ${count ? 'font-semibold text-ink' : 'text-ink-2'}`}>
       {port.label}
-      <PortHandle type="source" id={port.id} portType={port.type} />
+      <PortHandle type="source" id={port.id} portType={port.type} symbol={symbol} title={symbol ? 'Prompt + Generate · edit in the inspector' : port.label} />
     </div>
   );
 }
@@ -83,26 +89,29 @@ interface ShellProps {
   badge?: ReactNode;
   children?: ReactNode;
   width?: number;
+  outputSymbol?: boolean;
 }
 
-export const NodeShell = memo(function NodeShell({ node, hiddenInputs = [], badge, children, width = 240 }: ShellProps) {
+export const NodeShell = memo(function NodeShell({ node, hiddenInputs = [], badge, children, width = 240, outputSymbol }: ShellProps) {
   const def = getDefinition(node.type);
   const { title, collapsed, locked } = node.data;
   const frozen = useGraphStore((s) => s.frozenCount > 0 && isNodeFrozen(node.id));
-  const needsOriginal = useGraphStore((s) => node.type === 'generate' && generateNeedsOriginal(s.nodes, s.edges, node.id));
   const updateNodeData = useGraphStore((s) => s.updateNodeData);
   const inputs = def.inputs.filter((p) => !hiddenInputs.includes(p.id));
+  const updateInternals = useUpdateNodeInternals();
+  useEffect(() => { updateInternals(node.id); }, [node.id, outputSymbol, updateInternals]);
   // Source-only nodes (prompt, images, palette, input collection) put their single
   // output handle on the header instead of spending a whole row on it.
   const headerOutput = inputs.length === 0 && def.outputs.length === 1 ? def.outputs[0] : null;
   const showPortRows = !headerOutput && (inputs.length > 0 || def.outputs.length > 0);
   const showBody = !collapsed && Boolean(children);
 
+
   return (
     <div
       className={`rounded-[14px] border-2 bg-node ${
         node.selected ? 'border-accent ring-4 ring-accent/20' : frozen ? 'border-accent' : 'border-outline'
-      } ${frozen ? 'cursor-not-allowed' : ''}`}
+      }`}
       title={frozen ? 'Frozen while generating' : undefined}
       style={{ width }}
     >
@@ -145,8 +154,8 @@ export const NodeShell = memo(function NodeShell({ node, hiddenInputs = [], badg
 
       {showPortRows && (
         <div className="flex justify-between py-1">
-          <div>{inputs.map((p) => <InputRow key={p.id} port={p} required={isPortRequired(p, node.data, { needsOriginal })} />)}</div>
-          <div>{def.outputs.map((p) => <OutputRow key={p.id} port={p} />)}</div>
+          <div>{inputs.map((p) => <InputRow key={p.id} port={p} required={isPortRequired(p)} />)}</div>
+          <div>{def.outputs.map((p) => <OutputRow key={p.id} port={p} symbol={outputSymbol} />)}</div>
         </div>
       )}
 

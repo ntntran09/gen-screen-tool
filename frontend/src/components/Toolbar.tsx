@@ -119,9 +119,6 @@ export function Toolbar({ onSave, onRename }: { onSave: () => void; onRename: (n
       </div>
 
       <div className="ml-auto flex items-center gap-3">
-        <button type="button" disabled className="hidden text-[12px] text-ink-3 xl:block" title="Import/Export arrives in Phase 4">
-          Import / Export
-        </button>
         <button
           type="button"
           onClick={() => setDialogOpen(true)}

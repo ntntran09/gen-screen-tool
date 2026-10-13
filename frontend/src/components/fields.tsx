@@ -3,15 +3,17 @@ import { useId, type ReactNode } from 'react';
 const inputCls =
   'w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-[12px] text-ink outline-none placeholder:text-ink-3 focus:border-focus';
 
-export function Field({ label, hint, children }: { label: string; hint?: ReactNode; children: (id: string) => ReactNode }) {
+export function Field({ label, action, children }: { label: string; action?: ReactNode; hint?: ReactNode; children: (id: string) => ReactNode }) {
   const id = useId();
   return (
     <div className="space-y-1">
-      <label htmlFor={id} className="block text-[11px] font-medium text-ink-2">
-        {label}
-      </label>
+      <div className="flex items-center justify-between gap-2">
+        <label htmlFor={id} className="block text-[11px] font-medium text-ink-2">
+          {label}
+        </label>
+        {action}
+      </div>
       {children(id)}
-      {hint && <p className="text-[11px] text-ink-3">{hint}</p>}
     </div>
   );
 }
@@ -24,12 +26,15 @@ export function TextInput(props: {
   hint?: ReactNode;
   onBlur?: () => void;
   onEnter?: () => void;
+  /** id of a <datalist> offering suggestions. */
+  list?: string;
 }) {
   return (
     <Field label={props.label} hint={props.hint}>
       {(id) => (
         <input
           id={id}
+          list={props.list}
           className={inputCls}
           value={props.value}
           placeholder={props.placeholder}
@@ -47,9 +52,9 @@ export function TextInput(props: {
   );
 }
 
-export function TextArea(props: { label: string; value: string; onChange: (v: string) => void; placeholder?: string; rows?: number; hint?: ReactNode }) {
+export function TextArea(props: { label: string; value: string; onChange: (v: string) => void; placeholder?: string; rows?: number; hint?: ReactNode; action?: ReactNode }) {
   return (
-    <Field label={props.label} hint={props.hint}>
+    <Field label={props.label} hint={props.hint} action={props.action}>
       {(id) => (
         <textarea
           id={id}
@@ -112,7 +117,7 @@ export function Select<T extends string>(props: {
 
 export function Toggle(props: { label: string; checked: boolean; onChange: (v: boolean) => void; hint?: string }) {
   return (
-    <label className="flex cursor-pointer items-start gap-2 text-[12px] text-ink-2" title={props.hint}>
+    <label className="flex cursor-pointer items-start gap-2 text-[12px] text-ink-2">
       <input
         type="checkbox"
         className="mt-0.5 accent-[var(--color-accent)]"
@@ -124,13 +129,10 @@ export function Toggle(props: { label: string; checked: boolean; onChange: (v: b
   );
 }
 
-export function Section({ title, children, note }: { title: string; children: ReactNode; note?: string }) {
+export function Section({ title, children }: { title: string; children: ReactNode; note?: string }) {
   return (
     <section className="space-y-3 border-b border-line px-4 py-4">
-      <div>
-        <h3 className="text-[11px] font-semibold uppercase tracking-wider text-ink-3">{title}</h3>
-        {note && <p className="mt-1 text-[11px] text-ink-3">{note}</p>}
-      </div>
+      {title && <h3 className="text-[11px] font-semibold uppercase tracking-wider text-ink-3">{title}</h3>}
       {children}
     </section>
   );

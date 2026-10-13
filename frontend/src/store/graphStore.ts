@@ -10,10 +10,11 @@ import {
 import { nanoid } from 'nanoid';
 import { create } from 'zustand';
 import { uuid } from '../lib/uuid';
+import { useAssetStore } from './assetStore';
 import { getDefinition, isNodeKind } from '../graph/registry';
 import { collectionItems, makeItems, nodeAssetId, readingOrder } from '../graph/collections';
-import { assetPrompt, currentDetections, sourceAssetFor } from '../graph/detect';
-import { attachResults, connectedOutputCollection, extractedCollection, type TaskResult } from '../graph/generation';
+import { currentDetections, sourceAssetFor } from '../graph/detect';
+import { attachResults, connectedOutputCollection, type TaskResult } from '../graph/generation';
 import { findFreeSpot } from '../graph/layout';
 import type {
   AnyNodeData,
@@ -22,14 +23,15 @@ import type {
   CollectionData,
   CollectionItem,
   ExtractData,
+  GenerateData,
   NodeKind,
-  ImageData,
   OutputData,
   PaletteData,
 } from '../graph/types';
-import { GAME_ASSET_KEYS, LEGACY_IMAGE_KINDS } from '../graph/types';
+import { LEGACY_IMAGE_KINDS } from '../graph/types';
 import { checkConnection } from '../graph/validation';
-import { api, type ProjectDetail, type Viewport } from '../lib/api';
+import { api, toGraphPayload, type GraphPayload, type ProjectDetail, type Viewport } from '../lib/api';
+import { applyGraphOps, graphDiff } from '../lib/graphSync';
 
 interface Snapshot {
   nodes: CanvasNode[];
@@ -39,7 +41,7 @@ interface Snapshot {
 export type SaveStatus = 'saved' | 'dirty' | 'saving' | 'error';
 
 /** Canvas pointer tool: box-select, hand (left-drag pans), or eraser (click/drag deletes). */
-export type CanvasTool = 'select' | 'pan' | 'eraser';
+export type CanvasTool = 'select' | 'pan' | 'eraser' | 'text' | 'draw';
 
 export interface Toast {
   id: number;
@@ -71,6 +73,7 @@ interface GraphState {
   setTool: (tool: CanvasTool) => void;
 
   loadProject: (project: ProjectDetail) => void;
+  applySyncedGraph: (graph: GraphPayload) => void;
   setProjectName: (name: string) => void;
   setSaveStatus: (status: SaveStatus, error?: string | null) => void;
   setViewport: (viewport: Viewport) => void;
@@ -92,6 +95,8 @@ interface GraphState {
   updateNodeData: (id: string, patch: Partial<AnyNodeData>) => void;
   /** Replace a collection's items. Pass a coalesce key for typing so one edit is one undo step. */
   setCollectionItems: (id: string, items: CollectionItem[], coalesceKey?: string) => void;
+  expandCollection: (id: string, itemIds?: string[]) => void;
+  placeInlineResult: (nodeId: string, assetId: string, prompt: string, batchId: string, settings?: Partial<GenerateData>, pending?: { slot_index: number; attempt_number: number }, title?: string, resultAction?: OutputData['resultAction']) => string | null;
   /** Turn single-image nodes (default: the selection) into one Input Collection. Returns its id. */
   groupIntoCollection: (ids?: string[]) => string | null;
   /**
@@ -99,16 +104,8 @@ interface GraphState {
    * `count` defaults to the node's own setting. Resolves to false when there is nothing to read.
    */
   extractPalette: (paletteId: string, count?: number) => Promise<boolean>;
-  /**
-   * "Redraw nodes" for an Extract Assets node: lists the connected original image once per ticked asset in
-   * the Input Collection on its Assets port (each item with its own label and instruction: what the asset
-   * is and where it sits), and, unless a Generate already uses that collection, adds a Prompt and a
-   * Generate in Match inputs mode fed by it. Nothing is generated until the user presses Generate.
-   * One undo step. Returns what happened, or null when there is nothing to redraw or the collection is locked.
-   */
-  addExtractionWorkflow: (
-    extractNodeId: string,
-  ) => { collection: string; prompt: string | null; generate: string | null; count: number } | null;
+  /** Build or update an Asset sheet Generate from selected detections. One undo step. */
+  addExtractionWorkflow: (extractNodeId: string) => Promise<{ collection: string; prompt: string | null; generate: string; count: number; created: boolean } | null>;
   /** Replace an Input Collection with one Original node per item. */
   ungroupCollection: (id: string) => void;
   /**
@@ -135,7 +132,7 @@ interface GraphState {
 }
 
 /**
- * Generate nodes with a batch running. They are frozen: not movable, deletable or connectable
+ * Generate nodes with a batch running. They are frozen: not editable, deletable or connectable
  * until the batch ends. Transient (never saved or undone); kept in step by generationStore.
  */
 let frozenIds: ReadonlySet<string> = new Set();
@@ -149,10 +146,12 @@ export const isNodeFrozen = (id: string) => frozenIds.has(id);
 
 /** Apply per-node interaction flags derived from data (lock state) and running batches. */
 function withFlags(node: CanvasNode): CanvasNode {
+  if (node.type === 'text' && node.height !== undefined) node = { ...node, height: undefined };
   const locked = isNodeLocked(node);
+  const draggable = !node.data.locked;
   const frozen = frozenIds.has(node.id);
-  if (node.draggable === !locked && node.deletable === !locked && node.connectable === !frozen) return node;
-  return { ...node, draggable: !locked, deletable: !locked, connectable: !frozen };
+  if (node.draggable === draggable && node.deletable === !locked && node.connectable === !frozen) return node;
+  return { ...node, draggable, deletable: !locked, connectable: !frozen };
 }
 
 function stripSelection(snapshot: Snapshot): Snapshot {
@@ -163,10 +162,9 @@ function stripSelection(snapshot: Snapshot): Snapshot {
 }
 
 function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
-  const idMap = new Map<string, string>();
+  const idMap = new Map(source.nodes.map((n) => [n.id, uuid()]));
   const nodes = source.nodes.map((n) => {
-    const id = uuid();
-    idMap.set(n.id, id);
+    const id = idMap.get(n.id)!;
     return withFlags({
       id,
       type: n.type,
@@ -175,7 +173,14 @@ function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
       height: n.height,
       // Assets are referenced by id, never copied, so a pasted node points at the same file.
       // A copied Output Collection keeps its images but no longer receives the original's batches.
-      data: n.type === 'collection' ? { ...structuredClone(n.data), batchIds: [] } : structuredClone(n.data),
+      data: n.data.inlineGeneration
+        ? { ...structuredClone(n.data), ...(n.type === 'collection' ? { batchIds: [] } : {}),
+          inlineGeneration: { ...structuredClone(n.data.inlineGeneration), id: uuid(), batchIds: [] } }
+        : n.type === 'collection'
+        ? { ...structuredClone(n.data), batchIds: [] }
+        : n.type === 'extract'
+          ? { ...structuredClone(n.data), generateNodeId: idMap.get((n.data as ExtractData).generateNodeId ?? '') ?? null, collectionNodeId: idMap.get((n.data as ExtractData).collectionNodeId ?? '') ?? null }
+          : structuredClone(n.data),
       selected: true,
     });
   });
@@ -191,39 +196,21 @@ function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
   return { nodes, edges };
 }
 
-/** Prompt for redrawing found assets; {asset_name} is each asset's label, filled per task. */
-export const EXTRACT_PROMPT =
-  'Redraw the {asset_name} from the original image as a clean, standalone game asset: a single isolated object with ' +
-  'the same design, colors and proportions as it has in the original, polished and sharp, centered with even margins, ' +
-  'on a transparent background. Show only that one asset and nothing else from the original image.';
+const EXTRACT_PROMPT_V1 = 'Isolate the target asset specified in the per-image instructions from this crop. Remove the background and all other objects, including neighboring or attached components that are not part of the target. Keep only the target asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. Do not restyle, add other objects or create multiple copies. Return one isolated asset.';
+export const EXTRACT_PROMPT = 'Isolate the target asset specified in the per-image instructions from this crop. Remove the background and all other objects, including neighboring or attached components that are not part of the target. Keep only the target asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. When the per-image instructions describe the request the source image was made from, use it to understand the intended theme, materials and style, and redraw the asset so it clearly belongs to that theme, including parts the crop hides or blurs. Do not change what the asset is, add other objects or create multiple copies. Return one isolated asset.';
 
 /** Old projects had separate Original / Theme nodes; both are an Image node now (role = port). */
 function upgradeLegacyNode<T extends { type: string; data: Record<string, unknown> }>(n: T): T {
+  if (n.type === 'generate' && 'concurrency' in n.data) {
+    const data = { ...n.data };
+    delete data.concurrency;
+    return { ...n, data };
+  }
   if (!(LEGACY_IMAGE_KINDS as readonly string[]).includes(n.type)) return n;
   const legacyTitle = n.type === 'original' ? 'Original Image' : 'Theme Image';
   return { ...n, type: 'image', data: { ...n.data, title: n.data.title === legacyTitle ? 'Image' : n.data.title } };
 }
 
-/**
- * Game-asset settings used to live on the Generate node. A prompt saved before the move gets
- * them from the Generate node it feeds, so loading an old project keeps the same results.
- */
-function moveGameAssetSettings<T extends { id: string; type: string; data: Record<string, unknown> }>(
-  nodes: T[],
-  edges: { source: string; target: string; targetHandle: string | null }[],
-): T[] {
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  return nodes.map((n) => {
-    if (n.type !== 'prompt' || 'assetCategory' in n.data) return n;
-    const gen = edges
-      .filter((e) => e.source === n.id && e.targetHandle === 'prompt')
-      .map((e) => byId.get(e.target))
-      .find((g) => g?.type === 'generate' && 'assetCategory' in g.data);
-    if (!gen) return n;
-    const moved = Object.fromEntries(GAME_ASSET_KEYS.filter((k) => k in gen.data).map((k) => [k, gen.data[k]]));
-    return { ...n, data: { ...n.data, ...moved } };
-  });
-}
 
 let toastSeq = 0;
 
@@ -251,7 +238,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       set({
         projectId: project.id,
         projectName: project.name,
-        nodes: moveGameAssetSettings(project.graph.nodes, project.graph.edges)
+        nodes: project.graph.nodes
           .map(upgradeLegacyNode)
           .filter((n) => isNodeKind(n.type))
           .map((n) =>
@@ -276,6 +263,31 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       }),
 
     setProjectName: (name) => set({ projectName: name }),
+    applySyncedGraph: (graph) => {
+      const current = get();
+      const changes = graphDiff(toGraphPayload(current.nodes, current.edges, current.viewport), graph);
+      if (!changes.length) return;
+      const convert = (payload: GraphPayload, existing: CanvasNode[]) => {
+        const byId = new Map(existing.map((n) => [n.id, n]));
+        return payload.nodes.filter((n) => isNodeKind(n.type)).map((n) => {
+          const old = byId.get(n.id);
+          if (old && n.data === old.data && n.position.x === old.position.x && n.position.y === old.position.y
+            && (n.width ?? undefined) === old.width && (n.height ?? undefined) === old.height) return withFlags(old);
+          const fresh = withFlags({ ...old, id: n.id, type: n.type as NodeKind, position: n.position,
+            width: n.width ?? undefined, height: n.height ?? undefined,
+            data: { ...getDefinition(n.type as NodeKind).defaultData(), ...n.data } as AnyNodeData });
+          return old && JSON.stringify(old) === JSON.stringify(fresh) ? old : fresh;
+        });
+      };
+      const rebase = (snapshot: Snapshot): Snapshot => {
+        const payload = applyGraphOps(toGraphPayload(snapshot.nodes, snapshot.edges, current.viewport), changes);
+        return { nodes: convert(payload, snapshot.nodes), edges: payload.edges };
+      };
+      const edgesById = new Map(current.edges.map((e) => [e.id, e]));
+      set({ nodes: convert(graph, current.nodes),
+        edges: graph.edges.map((e) => ({ ...edgesById.get(e.id), ...e })),
+        past: current.past.map(rebase), future: current.future.map(rebase) });
+    },
     frozenCount: 0,
     setFrozen: (ids) => {
       const next = new Set(ids);
@@ -310,10 +322,14 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       const { past, future, nodes, edges } = get();
       const prev = past.at(-1);
       if (!prev) return;
+      if (nodes.some((n) => isNodeFrozen(n.id) && !prev.nodes.some((p) => p.id === n.id))) {
+        get().showToast('Generating nodes cannot be deleted.');
+        return;
+      }
       set({
         past: past.slice(0, -1),
         future: [stripSelection({ nodes, edges }), ...future],
-        nodes: prev.nodes,
+        nodes: prev.nodes.map(withFlags),
         edges: prev.edges,
         lastCommit: null,
       });
@@ -324,10 +340,14 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       const { past, future, nodes, edges } = get();
       const next = future[0];
       if (!next) return;
+      if (nodes.some((n) => isNodeFrozen(n.id) && !next.nodes.some((p) => p.id === n.id))) {
+        get().showToast('Generating nodes cannot be deleted.');
+        return;
+      }
       set({
         past: [...past, stripSelection({ nodes, edges })],
         future: future.slice(1),
-        nodes: next.nodes,
+        nodes: next.nodes.map(withFlags),
         edges: next.edges,
         lastCommit: null,
       });
@@ -335,13 +355,19 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     },
 
     onNodesChange: (changes) => {
-      set({ nodes: applyNodeChanges(changes, get().nodes) });
+      const canMove = get().tool === 'select' || get().tool === 'pan';
+      changes = changes.filter((c) => c.type !== 'position' || !c.position || canMove);
+      changes = changes.filter((c) => c.type !== 'remove' || !get().nodes.some((n) => n.id === c.id && isNodeLocked(n)));
+      changes = changes.map((c) => c.type === 'dimensions' && c.setAttributes && get().nodes.some((n) => n.id === c.id && n.type === 'text')
+        ? { ...c, setAttributes: 'width' as const } : c);
+      set({ nodes: applyNodeChanges(changes, get().nodes).map(withFlags) });
       if (changes.some((c) => c.type === 'position' || c.type === 'remove' || (c.type === 'dimensions' && c.setAttributes))) {
         touch();
       }
     },
 
     onEdgesChange: (changes) => {
+      changes = changes.filter((c) => c.type !== 'remove' || !get().edges.some((e) => e.id === c.id && (isNodeFrozen(e.source) || isNodeFrozen(e.target))));
       set({ edges: applyEdgeChanges(changes, get().edges) });
       if (changes.some((c) => c.type === 'remove')) touch();
     },
@@ -446,10 +472,45 @@ export const useGraphStore = create<GraphState>()((set, get) => {
 
     setCollectionItems: (id, items, coalesceKey) => {
       const node = get().nodes.find((n) => n.id === id);
-      if (node?.type !== 'collection') return;
+      if (node?.type !== 'collection' || isNodeLocked(node)) return;
       get().commit(coalesceKey);
       set((s) => ({ nodes: s.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, items } as AnyNodeData } : n)) }));
       touch();
+    },
+
+    expandCollection: (id, itemIds) => {
+      const node = get().nodes.find((n) => n.id === id);
+      if (node?.type !== 'collection' || isNodeLocked(node)) return;
+      const items = collectionItems(node).filter((i) => !itemIds || itemIds.includes(i.id));
+      get().addNodes(items.map((item, i) => ({
+        kind: 'image',
+        position: { x: node.position.x + 320 + (i % 4) * 280, y: node.position.y + Math.floor(i / 4) * 280 },
+        data: { assetId: item.assetId },
+      })));
+    },
+
+    placeInlineResult: (nodeId, assetId, prompt, batchId, settings = {}, pending, title, resultAction) => {
+      const { nodes, edges, commit } = get();
+      const source = nodes.find((n) => n.id === nodeId);
+      if (!source || isNodeLocked(source)) return null;
+      if (nodeAssetId(source) !== assetId && !(source.type === 'collection' && collectionItems(source).some((i) => i.assetId === assetId))) return null;
+      const generationId = source.data.inlineGeneration?.id ?? uuid();
+      const result: CanvasNode = withFlags({ id: uuid(), type: 'output',
+        position: findFreeSpot({ x: source.position.x + 320, y: source.position.y }, nodes),
+        data: { ...getDefinition('output').defaultData(), title: title ?? (pending ? 'Retried result' : 'Edited result'), generationId: batchId, sourceNodeId: source.id,
+          ...(resultAction || pending ? { resultAction: resultAction ?? 'retry' } : {}),
+          ...(pending ? { pendingSlot: pending.slot_index, pendingAttempt: pending.attempt_number } : {}),
+        },
+      });
+      commit();
+      set({ nodes: [...nodes.map((n) => n.id === source.id ? { ...n, data: { ...n.data,
+        inlineGeneration: { id: generationId, assetId, prompt: prompt.trim(), settings,
+          batchIds: [...new Set([...(source.data.inlineGeneration?.batchIds ?? []), batchId])] },
+      } } : n), result], edges: [...edges,
+        { id: uuid(), source: source.id, sourceHandle: 'out', target: result.id, targetHandle: 'edit' },
+      ] });
+      touch();
+      return generationId;
     },
 
     groupIntoCollection: (ids) => {
@@ -463,10 +524,6 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       commit();
       const memberIds = new Set(members.map((n) => n.id));
       const items = makeItems(members.map((n) => nodeAssetId(n)!));
-      // An Original's own instructions become that item's prompt override.
-      members.forEach((n, i) => {
-        if (n.type === 'image') items[i].promptOverride = (n.data as ImageData).instructions ?? '';
-      });
       const collection = withFlags({
         id: uuid(),
         type: 'collection',
@@ -503,96 +560,82 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       return collection.id;
     },
 
-    addExtractionWorkflow: (extractNodeId) => {
-      const { nodes, edges, commit, showToast } = get();
-      const extract = nodes.find((n) => n.id === extractNodeId);
-      if (extract?.type !== 'extract') return null;
+    addExtractionWorkflow: async (extractNodeId) => {
+      const initial = get();
+      const extract = initial.nodes.find((n) => n.id === extractNodeId);
+      if (extract?.type !== 'extract' || isNodeLocked(extract) || !initial.projectId) return null;
       const data = extract.data as ExtractData;
-      const assetId = sourceAssetFor(nodes, edges, extractNodeId);
+      const assetId = sourceAssetFor(initial.nodes, initial.edges, extractNodeId);
       const found = currentDetections(data, assetId);
-      const off = new Set(data.off ?? []);
-      const chosen = found ? found.items.filter((_, i) => !off.has(i)) : [];
+      const chosen = found?.items.filter((_, i) => !data.off.includes(i)) ?? [];
       if (!assetId || chosen.length === 0) return null;
-      const existing = extractedCollection(nodes, edges, extractNodeId);
-      if (existing && isNodeLocked(existing)) {
-        showToast('The connected collection is locked. Unlock it to replace its list.', 'error');
+      const oldGenerate = initial.nodes.find((n) => n.id === data.generateNodeId && n.type === 'generate');
+      const oldCollection = initial.nodes.find((n) => n.id === data.collectionNodeId && n.type === 'collection');
+      const blocked = () => [oldGenerate, oldCollection].some((n) => n && isNodeLocked(n));
+      if (blocked()) {
+        initial.showToast('The collection or Generate node is locked or generating.', 'error');
         return null;
       }
-      commit();
-      // The same full image, once per asset: the label names it and the override says which asset to take.
-      const items: CollectionItem[] = chosen.map((asset) => ({
-        id: nanoid(10),
-        assetId,
-        enabled: true,
-        label: asset.name,
-        promptOverride: assetPrompt(asset),
-      }));
-      let nextNodes = nodes.map((n) => (n.selected ? { ...n, selected: false } : n));
-      let nextEdges = edges;
-      const wire = (from: string, to: string, handle: string): CanvasEdge => ({
-        id: `e-${nanoid(10)}`,
-        source: from,
-        sourceHandle: 'out',
-        target: to,
-        targetHandle: handle,
+      // The request that made the source image tells the model which theme to rebuild each asset in.
+      // Best effort: a plain upload has none, and a failed lookup must not block the crop.
+      const originPrompts = await api.assetOriginPrompts(assetId).then((r) => r.prompts, () => [] as string[]);
+      const { assets } = await api.cropAssets(assetId, chosen.map(({ name, x, y, w, h }) => ({ name, x, y, w, h })));
+      const { nodes, edges, commit } = get();
+      // Do not attach delayed crops to another project or overwrite edits made during the request.
+      if (get().projectId !== initial.projectId || nodes.find((n) => n.id === extractNodeId)?.data !== data ||
+          sourceAssetFor(nodes, edges, extractNodeId) !== assetId ||
+          [oldGenerate, oldCollection].some((old) => old && nodes.find((n) => n.id === old.id) !== old) || blocked()) return null;
+      useAssetStore.getState().upsert(assets);
+      const items = makeItems(assets.map((a) => a.id));
+      items.forEach((item, i) => {
+        const target = chosen[i];
+        const clean = (text: string) => text.replace(/[{}]/g, '').replace(/\s+/g, ' ').trim();
+        const context = clean(originPrompts.join(' Then edited: ')).slice(0, 700);
+        item.promptOverride = `Target asset: "${clean(target.name)}". ${clean(target.description)} Keep only this target; remove all other objects in the crop.` +
+          (context ? ` Source image context: the full image was created from this request: "${context}". Use it to understand the theme and style, and make this asset match it.` : '');
       });
-      let collection: CanvasNode;
-      if (existing) {
-        collection = { ...existing, data: { ...existing.data, items } as AnyNodeData };
-        nextNodes = nextNodes.map((n) => (n.id === existing.id ? collection : n));
-      } else {
-        collection = withFlags({
-          id: uuid(),
-          type: 'collection',
-          position: findFreeSpot({ x: extract.position.x + 330, y: extract.position.y }, nodes),
-          data: { ...getDefinition('collection').defaultData(), title: 'Assets to redraw', items } as AnyNodeData,
-        });
-        nextNodes = [...nextNodes, collection];
-        nextEdges = [...nextEdges, wire(extractNodeId, collection.id, 'extract')];
-      }
-      // A Generate that already reads this collection keeps working with the refreshed list.
-      const hasGenerate = nextEdges.some(
-        (e) => e.source === collection.id && e.targetHandle === 'original' && nodes.find((n) => n.id === e.target)?.type === 'generate',
-      );
-      let promptId: string | null = null;
-      let generateId: string | null = null;
-      if (!hasGenerate) {
-        const origin = findFreeSpot({ x: collection.position.x + 360, y: collection.position.y }, nextNodes);
-        const prompt = withFlags({
-          id: uuid(),
-          type: 'prompt',
-          position: { x: origin.x, y: origin.y - 260 },
-          data: {
-            ...getDefinition('prompt').defaultData(),
-            title: 'Redraw each asset',
-            text: EXTRACT_PROMPT,
-            assetCategory: 'Item',
-            // The original is a whole screen, not one asset to keep intact.
-            preserveSubject: false,
-            preserveSilhouette: false,
-          } as AnyNodeData,
-        });
-        const generate = withFlags({
-          id: uuid(),
-          type: 'generate',
-          position: origin,
-          data: {
-            ...getDefinition('generate').defaultData(),
-            title: 'Redraw assets',
-            mode: 'match',
-            aspectRatio: '1:1',
-            background: 'transparent',
-          } as AnyNodeData,
-          selected: true,
-        });
-        nextNodes = [...nextNodes, prompt, generate];
-        nextEdges = [...nextEdges, wire(prompt.id, generate.id, 'prompt'), wire(collection.id, generate.id, 'original')];
-        promptId = prompt.id;
-        generateId = generate.id;
-      }
-      set({ nodes: nextNodes, edges: nextEdges });
+      const wire = (from: string, to: string, handle: string): CanvasEdge => ({
+        id: `e-${nanoid(10)}`, source: from, sourceHandle: 'out', target: to, targetHandle: handle,
+      });
+      commit();
+      const collection: CanvasNode = oldCollection
+        ? { ...oldCollection, data: { ...oldCollection.data, role: 'input', items } as AnyNodeData }
+        : withFlags({
+            id: uuid(), type: 'collection',
+            position: findFreeSpot({ x: extract.position.x + 330, y: extract.position.y }, nodes),
+            data: { ...getDefinition('collection').defaultData(), title: 'Cropped assets', items } as AnyNodeData,
+          });
+      let nextNodes = nodes.map((n) => n.id === oldCollection?.id ? collection : { ...n, selected: false });
+      if (!oldCollection) nextNodes.push(collection);
+      const origin = findFreeSpot({ x: collection.position.x + 360, y: collection.position.y }, nextNodes);
+      const settings = { preset: 'assets', assetSelection: 'only the target asset specified in the per-image instructions', mode: 'match', variantsPerInput: 1, aspectRatio: 'match', primaryOriginalNodeId: null };
+      const generate: CanvasNode = oldGenerate
+        ? { ...oldGenerate, selected: true, data: { ...oldGenerate.data, ...settings } as AnyNodeData }
+        : withFlags({ id: uuid(), type: 'generate', position: origin,
+            data: { ...getDefinition('generate').defaultData(), title: 'Remove backgrounds', ...settings } as AnyNodeData, selected: true });
+      const promptEdge = oldGenerate && edges.find((e) => e.target === oldGenerate.id && e.targetHandle === 'prompt' && nodes.find((n) => n.id === e.source)?.type === 'prompt');
+      const prompt = !promptEdge ? withFlags({
+        id: uuid(), type: 'prompt', position: { x: collection.position.x, y: collection.position.y - 260 },
+        data: { ...getDefinition('prompt').defaultData(), title: 'Remove background', text: EXTRACT_PROMPT } as AnyNodeData,
+      }) : null;
+      nextNodes = nextNodes.map((n) => {
+        if (n.id === extractNodeId) return { ...n, data: { ...n.data, generateNodeId: generate.id, collectionNodeId: collection.id } as AnyNodeData };
+        if (n.id === oldGenerate?.id) return generate;
+        if (n.id === promptEdge?.source && ['Keep the original art style.', EXTRACT_PROMPT_V1, 'Remove the background from this cropped asset. Keep only the main asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. Do not restyle, add other objects or create multiple copies. Return one isolated asset.'].includes(String(n.data.text))) return { ...n, data: { ...n.data, text: EXTRACT_PROMPT, title: 'Remove background' } as AnyNodeData };
+        return n;
+      });
+      if (!oldGenerate) nextNodes.push(generate);
+      if (prompt) nextNodes.push(prompt);
+      set({
+        nodes: nextNodes,
+        edges: [
+          ...edges.filter((e) => !(e.target === generate.id && e.targetHandle === 'original') && !(e.target === collection.id && e.targetHandle === 'extract')),
+          wire(extractNodeId, collection.id, 'extract'), wire(collection.id, generate.id, 'original'),
+          ...(prompt ? [wire(prompt.id, generate.id, 'prompt')] : []),
+        ],
+      });
       touch();
-      return { collection: collection.id, prompt: promptId, generate: generateId, count: items.length };
+      return { collection: collection.id, prompt: prompt?.id ?? null, generate: generate.id, count: assets.length, created: !oldGenerate };
     },
 
     ungroupCollection: (id) => {
@@ -610,7 +653,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
           id: uuid(),
           type: 'image' as const,
           position: { x: node.position.x + (i % 4) * 230, y: node.position.y + Math.floor(i / 4) * 290 },
-          data: { ...getDefinition('image').defaultData(), assetId: item.assetId, instructions: item.promptOverride } as AnyNodeData,
+          data: { ...getDefinition('image').defaultData(), assetId: item.assetId } as AnyNodeData,
           selected: true,
         }),
       );
@@ -706,6 +749,11 @@ export const useGraphStore = create<GraphState>()((set, get) => {
         nodes: nodes
           .filter((n) => !dropped.has(n.id))
           .map((n) => {
+            if (n.data.inlineGeneration?.batchIds.includes(batchId)) {
+              return { ...n, data: { ...n.data, inlineGeneration: { ...n.data.inlineGeneration,
+                batchIds: n.data.inlineGeneration.batchIds.filter((id) => id !== batchId),
+              } } };
+            }
             const d = n.data as CollectionData;
             return n.type === 'collection' && d.batchIds?.includes(batchId)
               ? { ...n, data: { ...d, batchIds: d.batchIds.filter((b) => b !== batchId) } as AnyNodeData }
@@ -728,7 +776,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       const { nodes, edges, commit, showToast } = get();
       const removable = new Set(nodes.filter((n) => n.selected && !isNodeLocked(n)).map((n) => n.id));
       const lockedSelected = nodes.some((n) => n.selected && isNodeLocked(n));
-      const edgeIds = new Set(edges.filter((e) => e.selected).map((e) => e.id));
+      const edgeIds = new Set(edges.filter((e) => e.selected && !isNodeFrozen(e.source) && !isNodeFrozen(e.target)).map((e) => e.id));
       if (removable.size === 0 && edgeIds.size === 0) {
         if (lockedSelected) showToast('Locked nodes cannot be deleted. Unlock them first.');
         return;

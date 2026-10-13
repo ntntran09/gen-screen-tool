@@ -9,12 +9,14 @@ import type {
   PaletteData,
   PromptData,
 } from '../graph/types';
-import { aspectLabel } from '../graph/types';
+import { aspectLabel, PRESETS } from '../graph/types';
 import { AssetCaption, AssetThumb, MiniThumb } from '../components/AssetThumb';
 import { MunLoader } from '../components/MunLoader';
+import { OutputPlaceholder } from '../components/OutputPlaceholder';
 import { estimateTasks } from '../graph/generation';
 import { useImageImport } from '../hooks/useImageImport';
 import { formatDuration, useBatchTime } from '../hooks/useBatchTime';
+import { useEditableText } from '../hooks/useEditableText';
 import { useImageRoles } from '../hooks/useImageRoles';
 import { pickImageFiles } from '../lib/filePicker';
 import { useAssetStore } from '../store/assetStore';
@@ -23,6 +25,7 @@ import { useExtractStore } from '../store/extractStore';
 import { isRunning, latestBatchFor, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
 import { useGraphStore } from '../store/graphStore';
 import { NodeShell } from './NodeShell';
+import { TextNode, DrawingNode } from './AnnotationNodes';
 
 type P = NodeProps<CanvasNode>;
 
@@ -31,7 +34,7 @@ function Muted({ children }: { children: React.ReactNode }) {
 }
 
 /** Thumbnail + caption for nodes that hold one image; empty nodes offer a file chooser. */
-function NodeImage({ nodeId, assetId, emptyLabel = 'Drop, paste or choose an image' }: { nodeId: string; assetId: string | null; emptyLabel?: string }) {
+function NodeImage({ nodeId, assetId, emptyLabel = 'No image' }: { nodeId: string; assetId: string | null; emptyLabel?: string }) {
   const importImages = useImageImport();
   const choose = async () => {
     const files = await pickImageFiles(false);
@@ -48,22 +51,22 @@ function NodeImage({ nodeId, assetId, emptyLabel = 'Drop, paste or choose an ima
 function PromptNode(props: P) {
   const data = props.data as PromptData;
   const updateNodeData = useGraphStore((s) => s.updateNodeData);
+  const [text, setText] = useEditableText(data.text, (value) => updateNodeData(props.id, { text: value }));
   return (
     <NodeShell
       node={props}
-      badge={<span className="text-[10px] uppercase tracking-wide text-ink-3">{data.enabled ? data.assetCategory : 'Off'}</span>}
+      badge={<span className="text-[10px] uppercase tracking-wide text-ink-3">{data.enabled ? 'On' : 'Off'}</span>}
     >
       {/* nodrag/nowheel: typing, selecting text and scrolling stay inside the field instead of moving the canvas. */}
       <textarea
         aria-label="Main prompt"
-        value={data.text}
+        value={text}
         readOnly={data.locked}
         placeholder="Describe what to create or change…"
         rows={4}
-        onChange={(e) => updateNodeData(props.id, { text: e.target.value })}
+        onChange={(e) => setText(e.target.value)}
         className="nodrag nowheel block max-h-60 min-h-20 w-full resize-y rounded-md border border-line bg-panel-2 px-2 py-1.5 text-[12px] leading-relaxed text-ink outline-none placeholder:text-ink-3 focus:border-focus"
       />
-      {data.constraints && <p className="mt-1.5 line-clamp-2 text-[11px] text-ink-3">+ constraints</p>}
     </NodeShell>
   );
 }
@@ -71,9 +74,6 @@ function PromptNode(props: P) {
 function ImageNode(props: P) {
   const data = props.data as ImageData;
   const roles = useImageRoles(props.id);
-  const preserved = Object.entries(data.preserve ?? {})
-    .filter(([, on]) => on)
-    .map(([k]) => k);
   return (
     <NodeShell
       node={props}
@@ -81,9 +81,6 @@ function ImageNode(props: P) {
       badge={roles.length > 0 && <span className="text-[10px] uppercase tracking-wide text-ink-3">{roles.join(' · ')}</span>}
     >
       <NodeImage nodeId={props.id} assetId={data.assetId} />
-      {roles.includes('Original') && preserved.length > 0 && (
-        <p className="mt-2 text-[11px] text-ink-3">Preserve: {preserved.join(', ')}</p>
-      )}
       {roles.includes('Theme') && <p className="mt-1 text-[11px] text-ink-3">Theme: {data.roles.join(', ') || 'no role'}</p>}
     </NodeShell>
   );
@@ -139,7 +136,7 @@ function CollectionNode(props: P) {
         <div className="flex flex-col items-center gap-2 rounded-lg border-2 border-dashed border-line-strong bg-panel px-2 py-4 text-center text-[11px] text-ink-3">
           {data.role === 'input' ? (
             <>
-              <span>Drop several images here</span>
+              <span>Empty collection</span>
               {!data.locked && (
                 <button
                   type="button"
@@ -222,7 +219,7 @@ function ExtractNode(props: P) {
             <span className="font-semibold text-ink">{chosen}</span> ticked
           </p>
         )}
-        {found && <p className="text-ink-3">Review and build the redraw nodes in the panel on the right.</p>}
+
         {error && <p className="text-danger">{error}</p>}
       </div>
       {assetId && (
@@ -250,11 +247,11 @@ function GenerateNode(props: P) {
   const running = isRunning(batch);
   const time = useBatchTime(batch?.id);
   const open = batch && OPEN_STATUSES.includes(batch.status);
-  const { start, resume, retry } = useGenerationStore.getState();
+  const { start, resume, retry, cancel } = useGenerationStore.getState();
 
   const problems = [
     prompts.length === 0 && 'Needs a prompt',
-    data.mode === 'match' && originals.length === 0 && 'Needs original images',
+    originals.length === 0 && 'Needs an original image',
     data.mode === 'match' && originals.length > 0 && expected === 0 && 'No enabled originals',
   ].filter(Boolean) as string[];
   const summary =
@@ -266,6 +263,7 @@ function GenerateNode(props: P) {
   return (
     <NodeShell node={props} width={260}>
       <div className="space-y-1 text-[12px] text-ink-2">
+        <p>{data.editResult ? 'Edit result' : PRESETS.find((p) => p.id === data.preset)?.label}</p>
         <p>{summary}</p>
         <p className="text-ink-3">
           {aspectLabel(data.aspectRatio)} · quality {data.quality}
@@ -279,8 +277,22 @@ function GenerateNode(props: P) {
       {running && <MunLoader label={null} className="mt-3" />}
       {batch && (open || batch.failed_count > 0) && (
         <div className="mt-2 space-y-1.5 text-[11px]">
-          <div className="h-1.5 overflow-hidden rounded-full border border-outline bg-panel-2" aria-hidden>
-            <div className="h-full bg-success" style={{ width: `${(100 * done) / Math.max(1, batch.expected_count)}%` }} />
+          <div className="flex items-center gap-1.5">
+            <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full border border-outline bg-panel-2" aria-hidden>
+              <div className="h-full bg-success" style={{ width: `${(100 * done) / Math.max(1, batch.expected_count)}%` }} />
+            </div>
+            {open && (
+              <button type="button" aria-label="Cancel generation" disabled={batch.cancel_requested}
+                title={batch.cancel_requested
+                  ? 'Cancelling…'
+                  : 'Cancel: stops the images not sent yet. A request already sent cannot be stopped; its image is kept if it arrives.'}
+                className="nodrag flex size-4 shrink-0 items-center justify-center rounded-full border border-outline bg-node text-ink-2 hover:bg-danger-soft hover:text-danger focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-wait disabled:opacity-40"
+                onClick={() => void cancel(batch.id)}>
+                <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" aria-hidden="true">
+                  <path d="m5 5 14 14M19 5 5 19" />
+                </svg>
+              </button>
+            )}
           </div>
           <p className="text-ink-2">
             {batch.completed_count}/{batch.expected_count} done
@@ -326,17 +338,20 @@ function GenerateNode(props: P) {
 function OutputNode(props: P) {
   const data = props.data as OutputData;
   return (
-    <NodeShell node={props} width={200}>
+    <NodeShell node={props} width={200} hiddenInputs={data.sourceNodeId ? ['in'] : ['edit']}
+      outputSymbol={!!data.inlineGeneration}>
       {data.assetId ? (
         <NodeImage nodeId={props.id} assetId={data.assetId} />
       ) : (
-        <AssetThumb assetId={null} emptyLabel="Waiting for a generation" />
+        <OutputPlaceholder data={data} />
       )}
     </NodeShell>
   );
 }
 
 export const nodeTypes: NodeTypes = {
+  text: TextNode,
+  drawing: DrawingNode,
   prompt: PromptNode,
   image: ImageNode,
   palette: PaletteNode,

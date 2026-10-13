@@ -1,6 +1,16 @@
-import type { CanvasEdge, CanvasNode } from '../graph/types';
+import type { CanvasEdge, CanvasNode, DetectedAsset } from '../graph/types';
+import { getDefinition } from '../graph/registry';
+import type { BaseNodeData } from '../graph/types';
 
 const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api';
+let graphSaver: ((projectId: string) => Promise<void>) | null = null;
+export const setGraphSaver = (save: typeof graphSaver) => { graphSaver = save; };
+export function projectSyncUrl(projectId: string, clientId: string) {
+  const url = new URL(`${BASE}/projects/${encodeURIComponent(projectId)}/sync`, window.location.href);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.searchParams.set('client_id', clientId);
+  return url.href;
+}
 
 export class ApiError extends Error {
   readonly code: string;
@@ -57,6 +67,7 @@ export interface ProjectSummary {
   description: string;
   created_at: string;
   updated_at: string;
+  graph_revision?: number;
 }
 
 export interface ProjectDetail extends ProjectSummary {
@@ -79,7 +90,7 @@ export function toGraphPayload(nodes: CanvasNode[], edges: CanvasEdge[], viewpor
       position: { x: n.position.x, y: n.position.y },
       // Only explicit (user-resized) sizes are persisted; measured sizes stay automatic.
       width: n.width ?? null,
-      height: n.height ?? null,
+      height: n.type === 'text' ? null : n.height ?? null,
       data: n.data,
     })),
     edges: edges.map((e) => ({
@@ -93,12 +104,41 @@ export function toGraphPayload(nodes: CanvasNode[], edges: CanvasEdge[], viewpor
   };
 }
 
+/** Inline controls are expanded only in the immutable provider snapshot, never on the canvas. */
+export function toInlineGenerationPayload(graph: GraphPayload, sourceId: string): GraphPayload {
+  const source = graph.nodes.find((n) => n.id === sourceId);
+  const inline = (source?.data as BaseNodeData | undefined)?.inlineGeneration;
+  if (!source || !inline) throw new Error('The inline generation is missing.');
+  const promptId = `${inline.id}:prompt`;
+  const direct = ['output', 'image'].includes(source.type) && source.data.assetId === inline.assetId;
+  const originalId = direct ? source.id : `${inline.id}:image`;
+  return { ...graph, nodes: [...graph.nodes,
+    { id: promptId, type: 'prompt', position: source.position, data: { ...getDefinition('prompt').defaultData(), text: inline.prompt } },
+    { id: inline.id, type: 'generate', position: source.position, data: {
+      ...getDefinition('generate').defaultData(), ...inline.settings, title: inline.settings.title ?? 'Edit result',
+      editResult: true, mode: 'manual', outputCount: 1, aspectRatio: 'match', primaryOriginalNodeId: null,
+    } },
+    ...(!direct ? [{ id: originalId, type: 'image', position: source.position,
+      data: { ...getDefinition('image').defaultData(), assetId: inline.assetId } }] : []),
+  ], edges: [...graph.edges,
+    { id: `${inline.id}:original`, source: originalId, sourceHandle: 'out', target: inline.id, targetHandle: 'original' },
+    { id: `${inline.id}:request`, source: promptId, sourceHandle: 'out', target: inline.id, targetHandle: 'prompt' },
+  ] };
+}
+
 export const api = {
+  health: () => request<{ status: string; result_edit?: boolean; inline_result_edit?: boolean; retry_prompt?: boolean }>('GET', '/health'),
   listProjects: () => request<ProjectSummary[]>('GET', '/projects'),
   createProject: (name: string) => request<ProjectDetail>('POST', '/projects', { name }),
   getProject: (id: string) => request<ProjectDetail>('GET', `/projects/${encodeURIComponent(id)}`),
-  updateProject: (id: string, body: { name?: string; graph?: GraphPayload }) =>
-    request<ProjectSummary>('PUT', `/projects/${encodeURIComponent(id)}`, body),
+  updateProject: async (id: string, body: { name?: string; graph?: GraphPayload; graph_revision?: number }) => {
+    if (body.graph && graphSaver) {
+      await graphSaver(id);
+      if (body.name !== undefined) return request<ProjectSummary>('PUT', `/projects/${encodeURIComponent(id)}`, { name: body.name });
+      return request<ProjectSummary>('GET', `/projects/${encodeURIComponent(id)}`);
+    }
+    return request<ProjectSummary>('PUT', `/projects/${encodeURIComponent(id)}`, body);
+  },
   deleteProject: (id: string) => request<void>('DELETE', `/projects/${encodeURIComponent(id)}`),
   listProviders: () => request<ProviderInfo[]>('GET', '/providers'),
   listAssets: (projectId: string) => request<AssetInfo[]>('GET', `/projects/${encodeURIComponent(projectId)}/assets`),
@@ -106,8 +146,12 @@ export const api = {
     request<{ deleted: string[] }>('POST', `/projects/${encodeURIComponent(projectId)}/assets/delete`, { asset_ids: assetIds }),
   assetPalette: (id: string, count: number) =>
     request<{ colors: { hex: string; share: number }[] }>('GET', `/assets/${encodeURIComponent(id)}/palette?count=${count}`),
-  detectAssets: (assetId: string, providerId: string, hint: string) =>
-    request<DetectResult>('POST', `/assets/${encodeURIComponent(assetId)}/detect`, { provider_id: providerId, hint }),
+  detectAssets: (assetId: string, providerId: string, hint: string, model = '') =>
+    request<DetectResult>('POST', `/assets/${encodeURIComponent(assetId)}/detect`, { provider_id: providerId, hint, model }),
+  cropAssets: (assetId: string, boxes: Pick<DetectedAsset, 'name' | 'x' | 'y' | 'w' | 'h'>[]) =>
+    request<{ assets: AssetInfo[] }>('POST', `/assets/${encodeURIComponent(assetId)}/crop`, { boxes }),
+  assetOriginPrompts: (id: string) =>
+    request<{ prompts: string[] }>('GET', `/assets/${encodeURIComponent(id)}/origin-prompt`),
   getAsset: (id: string) => request<AssetInfo>('GET', `/assets/${encodeURIComponent(id)}`),
   renameAsset: (id: string, name: string) => request<AssetInfo>('PATCH', `/assets/${encodeURIComponent(id)}`, { name }),
   importAssets: async (projectId: string, files: File[]): Promise<ImportResult> => {
@@ -142,9 +186,10 @@ export const api = {
   generationTasks: (batchId: string) => request<GenerationTask[]>('GET', `/generations/${encodeURIComponent(batchId)}/tasks`),
   cancelGeneration: (batchId: string) =>
     request<{ batch: GenerationBatch; note: string | null }>('POST', `/generations/${encodeURIComponent(batchId)}/cancel`),
-  retryGeneration: (batchId: string, taskIds?: string[]) =>
+  retryGeneration: (batchId: string, taskIds?: string[], prompt?: string) =>
     request<{ batch: GenerationBatch; retried: number }>('POST', `/generations/${encodeURIComponent(batchId)}/retry`, {
       task_ids: taskIds ?? null,
+      ...(prompt !== undefined ? { prompt } : {}),
     }),
   resumeGeneration: (batchId: string) =>
     request<{ batch: GenerationBatch }>('POST', `/generations/${encodeURIComponent(batchId)}/resume`),
@@ -201,6 +246,7 @@ export interface GenerationBatch {
 }
 
 export interface GenerationTask {
+  prompt_parts?: { prefix: string; user_prompt: string; suffix: string };
   id: string;
   batch_id: string;
   project_id: string;
@@ -216,7 +262,7 @@ export interface GenerationTask {
     original_asset_id: string | null;
     theme_asset_ids: string[];
     reference_asset_ids: string[];
-    settings: Record<string, string>;
+    settings: Record<string, string | number>;
   };
   output_asset_id: string | null;
   result: {
@@ -246,7 +292,7 @@ export interface GenerationPreview {
     capabilities: Record<string, unknown>;
   } | null;
   mode?: 'manual' | 'match';
-  settings?: Record<string, string>;
+  settings?: Record<string, string | number>;
   theme_asset_ids?: string[];
   reference_asset_ids?: string[];
   palette?: { hex: string; role: string; ratio: number | null }[];
@@ -324,6 +370,7 @@ export interface ImportResult {
 }
 
 export const assetUrls = {
+  selected: (projectId: string, ids: string[]) => `${BASE}/projects/${encodeURIComponent(projectId)}/assets/download?${new URLSearchParams(ids.map((id) => ['ids', id]))}`,
   thumbnail: (id: string) => `${BASE}/assets/${encodeURIComponent(id)}/thumbnail`,
   file: (id: string) => `${BASE}/assets/${encodeURIComponent(id)}/file`,
   download: (id: string) => `${BASE}/assets/${encodeURIComponent(id)}/download`,

@@ -118,6 +118,31 @@ body {
 }
 
 /* Show what the eraser would delete. */
+.react-flow__node-drawing path[data-drawing-stroke]:hover {
+  stroke: var(--color-focus);
+}
+
+.react-flow__node-drawing circle[data-drawing-stroke]:hover {
+  fill: var(--color-focus);
+}
+
+.tool-eraser .react-flow__node-drawing,
+.tool-eraser .react-flow__node-drawing svg {
+  pointer-events: none;
+}
+
+.tool-eraser .react-flow__node-drawing [data-drawing-stroke] {
+  pointer-events: visiblePainted;
+}
+
+.tool-eraser .react-flow__node-drawing path[data-drawing-stroke]:hover {
+  stroke: var(--color-danger);
+}
+
+.tool-eraser .react-flow__node-drawing circle[data-drawing-stroke]:hover {
+  fill: var(--color-danger);
+}
+
 .tool-eraser .react-flow__node:hover > div {
   outline: 3px solid var(--color-danger);
   outline-offset: 2px;
@@ -131,6 +156,18 @@ body {
 .react-flow__node {
   /* Custom nodes paint their own chrome. */
   font-family: var(--font-sans);
+}
+
+/* Canvas notes share the app's ink outline and soft Mun blush. */
+.canvas-comment {
+  border: 2px solid var(--color-outline);
+  border-radius: 24px 24px 24px 0;
+  background: color-mix(in srgb, var(--color-mun-blush) 30%, var(--color-node));
+  padding: 14px 18px;
+}
+
+.canvas-comment[data-selected] {
+  border-color: var(--color-accent);
 }
 
 /* Our "output" node type shares its name with React Flow's built-in output node,
@@ -164,6 +201,15 @@ body {
   position: absolute;
   inset: -8px;
   border-radius: 9999px;
+}
+
+.react-flow__handle.inline-generation-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  color: var(--color-ink);
 }
 
 .react-flow__handle-left:hover,

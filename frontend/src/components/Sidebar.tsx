@@ -125,7 +125,7 @@ export function Sidebar({
                 );
               })}
             </ul>
-            <p className="px-0.5 pt-2 text-[11px] text-ink-3">Drag onto the canvas or click to add. Hover for details.</p>
+
           </>
         )}
 

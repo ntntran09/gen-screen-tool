@@ -1,6 +1,16 @@
 import { useEffect, useState } from 'react';
 import poster from '../assets/mun/mun-painting-poster.webp';
 import video from '../assets/mun/mun-painting.mp4';
+import erasePoster from '../assets/mun/mun-erasing-poster.webp';
+import eraseVideo from '../assets/mun/mun-erasing.mp4';
+import placingPoster from '../assets/mun/mun-placing-poster.webp';
+import placingVideo from '../assets/mun/mun-placing.mp4';
+
+const clips = {
+  painting: { video, poster },
+  erasing: { video: eraseVideo, poster: erasePoster },
+  placing: { video: placingVideo, poster: placingPoster },
+};
 
 function usePrefersReducedMotion() {
   const query = '(prefers-reduced-motion: reduce)';
@@ -23,13 +33,18 @@ export function MunLoader({
   label = 'Mun is painting…',
   playing = true,
   className = '',
+  variant = 'painting',
 }: {
   label?: string | null;
   playing?: boolean;
   className?: string;
+  variant?: keyof typeof clips;
 }) {
   const reduced = usePrefersReducedMotion();
-  const animate = playing && !reduced;
+  const [failedVideo, setFailedVideo] = useState<string | null>(null);
+  const clip = clips[variant];
+  const animate = playing && !reduced && failedVideo !== clip.video;
+  const mediaClass = `block ${variant === 'painting' ? 'aspect-[52/30]' : 'aspect-video'} w-full object-cover`;
   return (
     <div
       role={playing ? 'status' : undefined}
@@ -39,9 +54,11 @@ export function MunLoader({
       <div className="w-full overflow-hidden rounded-xl border-2 border-outline bg-app">
         {animate ? (
           <video
-            className="block aspect-[52/30] w-full object-cover"
-            src={video}
-            poster={poster}
+            className={mediaClass}
+            src={clip.video}
+            poster={clip.poster}
+            preload="metadata"
+            onError={() => setFailedVideo(clip.video)}
             autoPlay
             loop
             muted
@@ -49,7 +66,7 @@ export function MunLoader({
             aria-hidden
           />
         ) : (
-          <img src={poster} alt="" draggable={false} className="block aspect-[52/30] w-full object-cover" />
+          <img src={clip.poster} alt="" draggable={false} className={mediaClass} />
         )}
       </div>
       {label && <p className="text-[12px] font-medium text-ink-2">{label}</p>}

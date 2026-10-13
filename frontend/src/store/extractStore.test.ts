@@ -44,9 +44,12 @@ describe('extract store', () => {
     const spy = vi.spyOn(api, 'detectAssets').mockResolvedValue({ asset_id: 'screen', model: 'gpt-6-luna', elapsed_seconds: 7, assets: found });
     g().updateNodeData(ex, { hint: 'pots', off: [2] });
     await useExtractStore.getState().detect(ex);
-    expect(spy).toHaveBeenCalledWith('screen', 'codex', 'pots');
+    expect(spy).toHaveBeenCalledWith('screen', 'codex', 'pots', '');
     expect(data(ex).detections).toMatchObject({ assetId: 'screen', model: 'gpt-6-luna' });
     expect(data(ex).off).toEqual([]); // a new search starts with everything ticked
+    g().updateNodeData(ex, { model: 'gpt-5.6-luna' });
+    await useExtractStore.getState().detect(ex);
+    expect(spy).toHaveBeenLastCalledWith('screen', 'codex', 'pots', 'gpt-5.6-luna');
     expect(currentDetections(data(ex), sourceAssetFor(g().nodes, g().edges, ex))?.items).toHaveLength(3);
     g().updateNodeData(img, { assetId: 'other' });
     expect(currentDetections(data(ex), sourceAssetFor(g().nodes, g().edges, ex))).toBeNull(); // stale: the image changed
@@ -75,4 +78,18 @@ describe('extract store', () => {
     await useExtractStore.getState().detect(ex);
     expect(useExtractStore.getState().error[ex]).toBeUndefined();
   });
+  it('Build reports crop errors and prevents duplicate requests', async () => {
+    const { ex } = setup();
+    let reject!: (error: Error) => void;
+    const spy = vi.spyOn(g(), 'addExtractionWorkflow').mockReturnValue(new Promise((_, no) => { reject = no; }));
+    const pending = useExtractStore.getState().build(ex);
+    expect(useExtractStore.getState().busy[ex]).toBe('crop');
+    await useExtractStore.getState().build(ex);
+    expect(spy).toHaveBeenCalledTimes(1);
+    reject(new Error('Image missing'));
+    await pending;
+    expect(useExtractStore.getState().error[ex]).toBe('Image missing');
+    expect(useExtractStore.getState().busy[ex]).toBeUndefined();
+  });
+
 });

@@ -1,6 +1,6 @@
 """Batch queue and worker (spec §13, §20.1).
 
-One in-process worker runs tasks strictly one at a time (spec §13.4: sequential by default).
+One in-process scheduler runs Generate nodes concurrently, one request per node at a time.
 Every state change is written to SQLite first and then broadcast to SSE subscribers, so a
 browser refresh or an app restart can always rebuild progress from the database.
 """
@@ -15,11 +15,12 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from ..assets import AssetError, asset_file, get_asset_row, import_image, sanitize_display_name
+from ..assets import AssetError, asset_file, convert_generated_image, get_asset_row, import_image, sanitize_display_name
 from ..config import Settings
 from ..db import connect, now_iso, transaction
 from ..providers import ProviderError, ProviderRegistry
 from ..providers.base import GenerateRequest
+from .prompt_parts import split_prompt
 
 log = logging.getLogger("nodecanvas.generation")
 
@@ -88,6 +89,7 @@ def batch_dict(row: sqlite3.Row, active: int = 0) -> dict[str, Any]:
 
 
 def task_dict(row: sqlite3.Row, project_id: str) -> dict[str, Any]:
+    request = json.loads(row["provider_request_json"])
     return {
         "id": row["id"],
         "batch_id": row["batch_id"],
@@ -99,7 +101,8 @@ def task_dict(row: sqlite3.Row, project_id: str) -> dict[str, Any]:
         "source_name": row["source_name"],
         "status": row["status"],
         "prompt": row["prompt_snapshot"],
-        "request": json.loads(row["provider_request_json"]),
+        "request": request,
+        "prompt_parts": split_prompt(row["prompt_snapshot"], request.get("settings", {})),
         "output_asset_id": row["output_asset_id"],
         "result": json.loads(row["result_json"]) if row["result_json"] else None,
         "error_code": row["error_code"],
@@ -121,7 +124,7 @@ def refresh_batch(conn: sqlite3.Connection, batch_id: str) -> int:
     active = sum(statuses.count(s) for s in ACTIVE_TASK)
     status, finished = batch["status"], batch["finished_at"]
     reason = batch["status_reason"]
-    if any(s in RUNNING_TASK for s in statuses):
+    if any(s in RUNNING_TASK for s in statuses) and status not in ("paused", "interrupted"):
         status, finished = "running", None
     elif active:
         finished = None  # queued work left: keep queued/running/paused/interrupted as set
@@ -221,27 +224,48 @@ class GenerationEngine:
 
     # --- worker ----------------------------------------------------------------------------
 
-    def _next_task(self) -> sqlite3.Row | None:
+    def _next_task(self, inflight: dict[str, asyncio.Task[None]] | None = None) -> sqlite3.Row | None:
+        inflight = inflight or {}
         with self.db() as conn:
-            return conn.execute(
-                "SELECT t.id FROM generation_tasks t JOIN generation_batches b ON b.id = t.batch_id"
-                " WHERE t.status = 'queued' AND b.status IN ('queued', 'running')"
-                " ORDER BY b.created_at, t.slot_index, t.attempt_number LIMIT 1"
-            ).fetchone()
+            rows = conn.execute(
+                "SELECT t.id, t.status, b.project_id, b.generate_node_id, b.status AS batch_status"
+                " FROM generation_tasks t JOIN generation_batches b ON b.id = t.batch_id"
+                " WHERE t.status IN ('queued', 'preparing', 'running', 'cancel_requested')"
+                " ORDER BY b.created_at, b.rowid, t.slot_index, t.attempt_number"
+            ).fetchall()
+            # Include in-flight tasks before execute() updates their database status, and
+            # requests still finishing after their batch was paused/cancelled.
+            blocked = {(r["project_id"], r["generate_node_id"]) for r in rows
+                       if r["id"] in inflight or r["status"] in RUNNING_TASK}
+            return next((r for r in rows if r["status"] == 'queued'
+                         and r["batch_status"] in ('queued', 'running')
+                         and (r["project_id"], r["generate_node_id"]) not in blocked), None)
 
     async def _run(self) -> None:
-        while True:
-            row = self._next_task()
-            if row is None:
-                await self._wake.wait()
-                self._wake.clear()
-                continue
+        inflight: dict[str, asyncio.Task[None]] = {}
+
+        async def run_task(task_id: str) -> None:
             try:
-                await self.execute(row["id"])
+                await self.execute(task_id)
             except Exception:  # noqa: BLE001 - a broken task must never stop the queue (spec §27.3)
-                log.exception("generation task %s crashed", row["id"])
+                log.exception("generation task %s crashed", task_id)
                 with self.db() as conn:
-                    self._finish(conn, row["id"], "failed", error=("UNKNOWN_ERROR", "Unexpected error while generating."))
+                    self._finish(conn, task_id, "failed", error=("UNKNOWN_ERROR", "Unexpected error while generating."))
+            finally:
+                inflight.pop(task_id, None)
+                self.wake()
+
+        try:
+            while True:
+                self._wake.clear()
+                while (row := self._next_task(inflight)) is not None:
+                    inflight[row["id"]] = asyncio.create_task(run_task(row["id"]))
+                await self._wake.wait()
+        finally:
+            pending = list(inflight.values())
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _set(self, conn: sqlite3.Connection, task_id: str, **fields: Any) -> None:
         cols = ", ".join(f"{k} = ?" for k in fields)
@@ -285,7 +309,11 @@ class GenerationEngine:
     async def execute(self, task_id: str) -> None:
         with self.db() as conn:
             task = conn.execute("SELECT * FROM generation_tasks WHERE id = ?", (task_id,)).fetchone()
+            if task is None or task["status"] != "queued":
+                return
             batch = conn.execute("SELECT * FROM generation_batches WHERE id = ?", (task["batch_id"],)).fetchone()
+            if batch["status"] not in ("queued", "running"):
+                return
             self._set(conn, task_id, status="preparing", started_at=now_iso())
             request = json.loads(task["provider_request_json"])
 
@@ -337,9 +365,13 @@ class GenerationEngine:
                 if task["source_name"]
                 else f"{batch['name'] or 'generation'}_{task['slot_index'] + 1:02d}"
             )
+            if request.get("prompt_count", 1) > 1:  # keep files made from different prompts apart
+                base += f"_p{request.get('prompt_number', 1):02d}"
             try:
+                image_bytes = await asyncio.to_thread(convert_generated_image, result.image_bytes,
+                                                      request["settings"].get("output_format", "png"))
                 asset = import_image(
-                    conn, self.settings, batch["project_id"], sanitize_display_name(base), result.image_bytes, origin="generated"
+                    conn, self.settings, batch["project_id"], sanitize_display_name(base), image_bytes, origin="generated"
                 )
             except AssetError as exc:
                 code = "STORAGE_ERROR" if exc.code == "STORAGE_ERROR" else "EMPTY_RESULT"
@@ -359,6 +391,7 @@ class GenerationEngine:
                     "file_size": asset["file_size"],
                     "reported_model": result.reported_model,
                     "reported_settings": result.reported_settings,
+                    "provider_mime_type": result.mime_type,
                 },
             )
 

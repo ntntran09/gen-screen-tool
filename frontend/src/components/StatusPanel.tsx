@@ -35,7 +35,7 @@ function Jobs() {
   );
   const open = batches.filter((b) => OPEN_STATUSES.includes(b.status));
   const shown = open.length ? open.slice(0, 3) : batches.slice(0, 1);
-  const { resume, retry } = useGenerationStore.getState();
+  const { resume, retry, cancel } = useGenerationStore.getState();
   const focus = (b: GenerationBatch) => {
     const g = useGraphStore.getState();
     useGraphStore.setState({ nodes: g.nodes.map((n) => ({ ...n, selected: n.id === b.generate_node_id })) });
@@ -58,6 +58,12 @@ function Jobs() {
           {(b.status === 'paused' || b.status === 'interrupted') && b.active_count > 0 && (
             <button type="button" className={linkBtn} onClick={() => void resume(b.id)}>
               Resume
+            </button>
+          )}
+          {OPEN_STATUSES.includes(b.status) && !b.cancel_requested && (
+            <button type="button" className={linkBtn} onClick={() => void cancel(b.id)}
+              title="Stops the images not sent yet. A request already sent cannot be stopped.">
+              Cancel
             </button>
           )}
           {b.failed_count > 0 && b.status !== 'running' && b.status !== 'queued' && (

@@ -4,12 +4,13 @@ import type { ExtractData } from '../graph/types';
 import { api } from '../lib/api';
 import { useGraphStore } from './graphStore';
 
-type Busy = 'detect';
+type Busy = 'detect' | 'crop';
 
 interface ExtractState {
   /** Extract nodes with a request in flight (transient). */
   busy: Record<string, Busy | undefined>;
   error: Record<string, string | undefined>;
+  build: (nodeId: string) => Promise<void>;
   detect: (nodeId: string) => Promise<void>;
 }
 
@@ -32,6 +33,11 @@ export const useExtractStore = create<ExtractState>()((set, get) => {
     busy: {},
     error: {},
 
+    build: (nodeId) => run(nodeId, 'crop', async () => {
+      const result = await useGraphStore.getState().addExtractionWorkflow(nodeId);
+      if (result) useGraphStore.getState().showToast(`Cropped ${result.count} assets. Press Generate to remove their backgrounds.`);
+    }),
+
     detect: (nodeId) =>
       run(nodeId, 'detect', async () => {
         const { nodes, edges } = useGraphStore.getState();
@@ -41,7 +47,7 @@ export const useExtractStore = create<ExtractState>()((set, get) => {
         const provider = providers.find((p) => p.auth_state === 'connected')?.id;
         if (!provider) throw new Error('Connect ChatGPT first (the Codex button in the top bar).');
         const hint = dataOf(nodeId)?.hint ?? '';
-        const r = await api.detectAssets(assetId, provider, hint);
+        const r = await api.detectAssets(assetId, provider, hint, dataOf(nodeId)?.model ?? '');
         useGraphStore.getState().updateNodeData(nodeId, {
           detections: { assetId, model: r.model, seconds: r.elapsed_seconds, items: r.assets },
           off: [],

@@ -134,6 +134,9 @@ def test_hint_reaches_the_prompt() -> None:
 
     asyncio.run(detect_assets(Spy([]), png(), ("m",), hint="only the flowers"))
     assert "only the flowers" in seen[0] and "[x1, y1, x2, y2]" in seen[0]
+    assert "list EACH one separately" in seen[0]
+    assert "ONE representative instance" not in seen[0]
+    assert "POT and the FLOWER as separate" not in seen[0]
 
 
 # --- the Codex request and its event stream -----------------------------------------------------------------
@@ -230,3 +233,56 @@ def test_detect_endpoint_returns_boxes_and_the_model(ctx) -> None:
     res = c.post(f"/api/assets/{a}/detect", json={"provider_id": "scripted"}, headers=CSRF)
     assert res.status_code == 429 and res.json()["error"]["code"] == "QUOTA_EXCEEDED"
     assert c.post(f"/api/assets/{a}/detect", json={"provider_id": "nope"}, headers=CSRF).status_code == 404
+
+
+def test_crop_stores_actual_pixels_and_clamps_to_image_edges(ctx) -> None:
+    c, pid, provider = ctx
+    img = Image.new('RGB', (100, 80), 'red')
+    for x in range(50, 100):
+        for y in range(80):
+            img.putpixel((x, y), (0, 0, 255))
+    buf = io.BytesIO(); img.save(buf, 'PNG')
+    source = upload(c, pid, buf.getvalue())
+    res = c.post(f'/api/assets/{source}/crop', json={'boxes': [
+        {'name': 'red', 'x': 0, 'y': 0, 'w': .5, 'h': 1},
+        {'name': 'blue', 'x': .5, 'y': .5, 'w': 1, 'h': 1},
+    ]}, headers=CSRF)
+    assert res.status_code == 200, res.text
+    assets = res.json()['assets']
+    assert [(a['width'], a['height']) for a in assets] == [(50, 80), (50, 40)]
+    assert all(a['project_id'] == pid and a['origin'] == 'crop' for a in assets)
+    for asset, color in zip(assets, [(255, 0, 0, 255), (0, 0, 255, 255)]):
+        data = c.get(f"/api/assets/{asset['id']}/file").content
+        with Image.open(io.BytesIO(data)) as cropped:
+            assert cropped.getpixel((0, 0)) == color
+    assert provider.models == []  # cropping never invokes AI
+
+
+@pytest.mark.parametrize('boxes', [[], [{'name': 'x', 'x': 1, 'y': 0, 'w': .2, 'h': .2}],
+    [{'name': 'x', 'x': 0, 'y': 0, 'w': 0, 'h': .2}],
+    [{'name': 'x', 'x': -.1, 'y': 0, 'w': .2, 'h': .2}]])
+def test_crop_rejects_invalid_boxes_without_creating_assets(ctx, boxes) -> None:
+    c, pid, _ = ctx
+    source = upload(c, pid, png())
+    res = c.post(f'/api/assets/{source}/crop', json={'boxes': boxes}, headers=CSRF)
+    assert res.status_code == 422
+    assert len(c.get(f'/api/projects/{pid}/assets').json()) == 1
+
+
+def test_crop_refuses_missing_or_deleted_source(ctx) -> None:
+    c, pid, _ = ctx
+    body = {'boxes': [{'name': 'x', 'x': 0, 'y': 0, 'w': .5, 'h': .5}]}
+    assert c.post('/api/assets/missing/crop', json=body, headers=CSRF).status_code == 404
+    source = upload(c, pid, png())
+    c.post(f'/api/projects/{pid}/assets/delete', json={'asset_ids': [source]}, headers=CSRF)
+    assert c.post(f'/api/assets/{source}/crop', json=body, headers=CSRF).status_code == 404
+
+
+def test_detect_endpoint_uses_only_the_chosen_model_and_rejects_odd_names(ctx) -> None:
+    c, pid, provider = ctx
+    a = upload(c, pid, png((200, 100)))
+    res = c.post(f"/api/assets/{a}/detect", json={"provider_id": "scripted", "model": "my-model.1"}, headers=CSRF)
+    assert res.status_code == 200 and res.json()["model"] == "my-model.1"
+    assert provider.models == ["my-model.1"]  # no fallback list when a model is chosen
+    bad = c.post(f"/api/assets/{a}/detect", json={"provider_id": "scripted", "model": "x y;z"}, headers=CSRF)
+    assert bad.status_code == 422 or bad.status_code == 400

@@ -94,7 +94,7 @@ export function MiniThumb({ assetId, className = '' }: { assetId: string; classN
       decoding="async"
       draggable={false}
       onError={() => setFailed(true)}
-      className={`size-full object-cover ${className}`}
+      className={`size-full ${className || 'object-cover'}`}
     />
   );
 }

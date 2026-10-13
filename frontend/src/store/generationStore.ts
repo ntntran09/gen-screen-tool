@@ -6,12 +6,25 @@ import {
   ApiError,
   generationEventsUrl,
   toGraphPayload,
+  toInlineGenerationPayload,
   type BatchStatus,
   type GenerationBatch,
   type GenerationTask,
 } from '../lib/api';
 import { useAssetStore } from './assetStore';
 import { useGraphStore } from './graphStore';
+import type { GenerateData } from '../graph/types';
+
+const VARIATION_PROMPT = 'Create a subtle variation of this image. Preserve its art style, main subject and composition.';
+
+function variationSettings(batch?: GenerationBatch, task?: GenerationTask): Partial<GenerateData> {
+  const saved = task?.request.settings;
+  return { providerId: batch?.provider_id ?? 'codex', title: 'Variation',
+    ...(typeof saved?.model === 'string' ? { model: saved.model } : {}),
+    ...(['auto', 'low', 'medium', 'high'].includes(String(saved?.quality)) ? { quality: saved!.quality as GenerateData['quality'] } : {}),
+    ...(['png', 'webp', 'jpg'].includes(String(saved?.output_format)) ? { outputFormat: saved!.output_format as GenerateData['outputFormat'] } : {}),
+  };
+}
 
 /** Batch states that still have (or wait for) work. */
 export const OPEN_STATUSES: readonly BatchStatus[] = ['queued', 'running', 'paused', 'interrupted'];
@@ -26,10 +39,18 @@ interface GenerationState {
   starting: Record<string, true>;
   /** Generate node whose Preview Request dialog is open. */
   previewNodeId: string | null;
+  editTarget: { nodeId: string; assetId: string; prompt: string; mode?: 'variation'; shortPrompt?: string; prefix?: string; suffix?: string; expanded?: boolean; originalPrompt?: string; loading?: boolean; error?: string; batchId?: string; taskId?: string } | null;
+  openEdit: (nodeId: string, assetId: string) => Promise<void>;
+  openVariation: (nodeId: string, assetId: string, batchId?: string | null, taskId?: string | null) => Promise<void>;
+  closeEdit: () => void;
+  setEditPrompt: (prompt: string) => void;
+  toggleFullPrompt: () => void;
   openPreview: (generateId: string | null) => void;
   load: (projectId: string) => Promise<void>;
   loadTasks: (batchId: string) => Promise<GenerationTask[]>;
-  start: (generateId: string) => Promise<void>;
+  start: (generateId: string) => Promise<boolean>;
+  regenerate: (nodeId: string, assetId: string, prompt: string, batchId?: string | null, taskId?: string | null) => Promise<boolean>;
+  vary: (nodeId: string, assetId: string, prompt: string, batchId?: string | null, taskId?: string | null) => Promise<boolean>;
   cancel: (batchId: string) => Promise<void>;
   retry: (batchId: string, taskIds?: string[]) => Promise<void>;
   resume: (batchId: string) => Promise<void>;
@@ -122,12 +143,68 @@ export const useGenerationStore = create<GenerationState>()((set, get) => {
     tasks: {},
     starting: {},
     previewNodeId: null,
+    editTarget: null,
+    openEdit: async (nodeId, assetId) => {
+      if (get().editTarget?.nodeId === nodeId && get().editTarget?.assetId === assetId && !get().editTarget?.mode) {
+        set({ editTarget: null });
+        return;
+      }
+      const target = { nodeId, assetId, prompt: '', loading: true };
+      set({ editTarget: target });
+      try {
+        const source = useGraphStore.getState().nodes.find((n) => n.id === nodeId);
+        let task = Object.values(get().tasks).flat().find((t) => t.output_asset_id === assetId);
+        const batchId = source?.type === 'output' ? String(source.data.generationId ?? '') : '';
+        if (!task?.prompt_parts && (batchId || task?.batch_id)) {
+          task = (await get().loadTasks(batchId || task!.batch_id)).find((t) => t.output_asset_id === assetId);
+        }
+        if (!task) throw new Error('Generation history is unavailable for this image.');
+        if (get().editTarget === target) set({ editTarget: { nodeId, assetId, prompt: task.prompt, originalPrompt: task.prompt,
+          shortPrompt: task.prompt_parts?.user_prompt ?? task.prompt, prefix: task.prompt_parts?.prefix ?? '',
+          suffix: task.prompt_parts?.suffix ?? '', expanded: false, batchId: task.batch_id, taskId: task.id } });
+      } catch (err) {
+        if (get().editTarget === target) set({ editTarget: { ...target, loading: false, error: (err as Error).message } });
+      }
+    },
+    openVariation: async (nodeId, assetId, batchId, taskId) => {
+      if (get().editTarget?.nodeId === nodeId && get().editTarget?.assetId === assetId && get().editTarget?.mode === 'variation') {
+        set({ editTarget: null });
+        return;
+      }
+      const target = { nodeId, assetId, mode: 'variation' as const, prompt: VARIATION_PROMPT, shortPrompt: VARIATION_PROMPT, loading: true };
+      set({ editTarget: target });
+      try {
+        const g = useGraphStore.getState();
+        if (!g.projectId) throw new Error('No project is open.');
+        const settings = variationSettings(batchId ? get().batches[batchId] : undefined, batchId ? get().tasks[batchId]?.find((t) => t.id === taskId) : undefined);
+        const id = uuid();
+        const nodes = g.nodes.map((n) => n.id === nodeId ? { ...n, data: { ...n.data,
+          inlineGeneration: { id, assetId, prompt: VARIATION_PROMPT, settings, batchIds: [] },
+        } } : n);
+        const preview = await api.previewGeneration({ project_id: g.projectId, generate_node_id: id,
+          graph: toInlineGenerationPayload(toGraphPayload(nodes, g.edges, g.viewport), nodeId) });
+        if (!preview.ok || !preview.tasks[0]) throw new Error(preview.errors[0] ?? 'Cannot preview this variation.');
+        const full = preview.tasks[0].prompt;
+        const start = full.indexOf(VARIATION_PROMPT);
+        if (get().editTarget === target) set({ editTarget: { ...target, loading: false, batchId: batchId ?? undefined, taskId: taskId ?? undefined,
+          prompt: full, originalPrompt: full, prefix: start >= 0 ? full.slice(0, start) : '',
+          suffix: start >= 0 ? full.slice(start + VARIATION_PROMPT.length) : '',
+        } });
+      } catch (err) {
+        if (get().editTarget === target) set({ editTarget: { ...target, loading: false, error: (err as Error).message } });
+      }
+    },
+    closeEdit: () => set({ editTarget: null }),
+    setEditPrompt: (shortPrompt) => set((s) => ({ editTarget: s.editTarget ? { ...s.editTarget, shortPrompt,
+      prompt: shortPrompt.trim() ? `${s.editTarget.prefix ?? ''}${shortPrompt}${s.editTarget.suffix ?? ''}` : '',
+    } : null })),
+    toggleFullPrompt: () => set((s) => ({ editTarget: s.editTarget ? { ...s.editTarget, expanded: !s.editTarget.expanded } : null })),
     openPreview: (previewNodeId) => set({ previewNodeId }),
 
     load: async (projectId) => {
       const switching = get().projectId !== projectId;
       if (switching) {
-        set({ projectId, batches: {}, tasks: {}, previewNodeId: null });
+        set({ projectId, batches: {}, tasks: {}, previewNodeId: null, editTarget: null });
         connect(projectId);
       }
       try {
@@ -148,15 +225,16 @@ export const useGenerationStore = create<GenerationState>()((set, get) => {
     },
 
     loadTasks: async (batchId) => {
+      const projectId = get().projectId;
       const tasks = await api.generationTasks(batchId);
-      set((s) => ({ tasks: { ...s.tasks, [batchId]: tasks } }));
+      if (get().projectId === projectId) set((s) => ({ tasks: { ...s.tasks, [batchId]: tasks } }));
       return tasks;
     },
 
     start: async (generateId) => {
       const g = useGraphStore.getState();
       const projectId = g.projectId;
-      if (!projectId || get().starting[generateId]) return;
+      if (!projectId || get().starting[generateId]) return false;
       set((s) => ({ starting: { ...s.starting, [generateId]: true } }));
       // The node that receives the results is placed and saved before the batch exists, so a
       // reload or crash right after pressing Generate cannot orphan the results.
@@ -173,6 +251,7 @@ export const useGenerationStore = create<GenerationState>()((set, get) => {
           graph,
           batch_id: batchId,
         });
+        if (useGraphStore.getState().projectId !== projectId) return true;
         // Events for this batch may already have arrived; they are newer than the response.
         set((s) => {
           const seen = new Map((s.tasks[batch.id] ?? []).map((t) => [t.id, t]));
@@ -188,17 +267,106 @@ export const useGenerationStore = create<GenerationState>()((set, get) => {
           };
         });
         useGraphStore.getState().applyResults(get().tasks[batch.id] ?? []);
+        return true;
       } catch (err) {
         if (useGraphStore.getState().projectId === projectId) useGraphStore.getState().discardResultNode(batchId);
         if (err instanceof ApiError && err.errors.length > 1) {
           toast(`${err.errors[0]} (+${err.errors.length - 1} more — open Preview request for the full list)`, 'error');
         } else fail(err);
+        return false;
       } finally {
         set((s) => {
           const next = { ...s.starting };
           delete next[generateId];
           return { starting: next };
         });
+      }
+    },
+
+    regenerate: async (nodeId, assetId, prompt, batchId, taskId) => {
+      if (get().starting[nodeId]) return false;
+      const projectId = useGraphStore.getState().projectId;
+      set((s) => ({ starting: { ...s.starting, [nodeId]: true } }));
+      try {
+        if (!(await api.health()).retry_prompt) {
+          throw new Error('The backend is updating after the current jobs finish. Try again once they are done.');
+        }
+        if (useGraphStore.getState().projectId !== projectId) return false;
+        if (!batchId || !taskId) throw new Error('Generation history is unavailable for this image.');
+        const tasks = await get().loadTasks(batchId);
+        if (useGraphStore.getState().projectId !== projectId) return false;
+        const original = tasks.find((t) => t.id === taskId);
+        const latest = original && latestAttempts(tasks).find((t) => t.slot_index === original.slot_index);
+        if (!latest || ['queued', 'preparing', 'running', 'cancel_requested'].includes(latest.status)) {
+          throw new Error('This result already has an active attempt or its history is unavailable.');
+        }
+        const id = useGraphStore.getState().placeInlineResult(nodeId, assetId, prompt, batchId, {},
+          { slot_index: latest.slot_index, attempt_number: latest.attempt_number + 1 });
+        if (!id) return false;
+        let accepted = false;
+        try {
+          const placed = useGraphStore.getState();
+          await api.updateProject(projectId!, { graph: toGraphPayload(placed.nodes, placed.edges, placed.viewport) });
+          const beforeRetry = get().batches[batchId];
+          const response = await api.retryGeneration(batchId, [latest.id], prompt.trim() || original!.prompt);
+          accepted = true;
+          if (useGraphStore.getState().projectId !== projectId) return true;
+          if (get().batches[batchId] === beforeRetry) upsertBatch(response.batch);
+          const retried = await get().loadTasks(batchId);
+          if (useGraphStore.getState().projectId === projectId) useGraphStore.getState().applyResults(retried);
+          return true;
+        } catch (err) {
+          if (!accepted && useGraphStore.getState().projectId === projectId) {
+            // Other results can share this batch; remove only this retry's empty receiver.
+            const state = useGraphStore.getState();
+            const dropped = new Set(state.nodes.filter((n) => n.type === 'output' && !n.data.assetId &&
+              n.data.generationId === batchId && n.data.pendingSlot === latest.slot_index &&
+              n.data.pendingAttempt === latest.attempt_number + 1).map((n) => n.id));
+            useGraphStore.setState({ nodes: state.nodes.filter((n) => !dropped.has(n.id)),
+              edges: state.edges.filter((e) => !dropped.has(e.target)), revision: state.revision + 1, saveStatus: 'dirty' });
+          }
+          throw err;
+        }
+      } catch (err) {
+        fail(err);
+        return false;
+      } finally {
+        set((s) => {
+          const starting = { ...s.starting };
+          delete starting[nodeId];
+          return { starting };
+        });
+      }
+    },
+
+    vary: async (nodeId, assetId, prompt, batchId, taskId) => {
+      if (get().starting[nodeId]) return false;
+      const projectId = useGraphStore.getState().projectId;
+      if (!projectId) return false;
+      set((s) => ({ starting: { ...s.starting, [nodeId]: true } }));
+      const newBatchId = uuid();
+      let accepted = false;
+      try {
+        const settings = variationSettings(batchId ? get().batches[batchId] : undefined, batchId ? get().tasks[batchId]?.find((t) => t.id === taskId) : undefined);
+        const id = useGraphStore.getState().placeInlineResult(nodeId, assetId, prompt.trim() || VARIATION_PROMPT, newBatchId, settings, undefined, 'Varied result', 'variation');
+        if (!id) return false;
+        const g = useGraphStore.getState();
+        const graph = toGraphPayload(g.nodes, g.edges, g.viewport);
+        await api.updateProject(projectId, { graph });
+        const { batch, tasks } = await api.startGeneration({ project_id: projectId, generate_node_id: id,
+          graph: toInlineGenerationPayload(graph, nodeId), batch_id: newBatchId });
+        accepted = true;
+        if (useGraphStore.getState().projectId !== projectId) return true;
+        set((s) => ({ batches: { ...s.batches, [batch.id]: s.batches[batch.id] ?? batch },
+          tasks: { ...s.tasks, [batch.id]: tasks.map((t) => s.tasks[batch.id]?.find((seen) => seen.id === t.id) ?? t) } }));
+        useGraphStore.getState().applyResults(get().tasks[batch.id] ?? []);
+        return true;
+      } catch (err) {
+        if (!accepted && useGraphStore.getState().projectId === projectId) useGraphStore.getState().discardResultNode(newBatchId);
+        fail(err);
+        return false;
+      } finally {
+        set((s) => { const starting = { ...s.starting }; delete starting[nodeId]; return { starting }; });
       }
     },
 
@@ -234,10 +402,21 @@ export const useGenerationStore = create<GenerationState>()((set, get) => {
   };
 });
 
-// A Generate node is frozen exactly while a batch on it is queued or running.
-useGenerationStore.subscribe((state, prev) => {
-  if (state.batches === prev.batches) return;
+// Protect the running workflow and its result receivers, including newly loaded nodes.
+function syncFrozenNodes() {
+  const state = useGenerationStore.getState();
+  const nodes = useGraphStore.getState().nodes;
   useGraphStore
     .getState()
-    .setFrozen([...new Set(Object.values(state.batches).filter(isRunning).map((b) => b.generate_node_id))]);
+    .setFrozen([...new Set(Object.values(state.batches).filter(isRunning).flatMap((b) =>
+      [b.generate_node_id, ...nodes.filter((n) => n.data.inlineGeneration?.id === b.generate_node_id ||
+        n.data.inlineGeneration?.batchIds.includes(b.id) ||
+        (n.type === 'output' && n.data.generationId === b.id) ||
+        (n.type === 'collection' && Array.isArray(n.data.batchIds) && n.data.batchIds.includes(b.id))).map((n) => n.id)]))]);
+}
+useGenerationStore.subscribe((state, prev) => {
+  if (state.batches !== prev.batches) syncFrozenNodes();
+});
+useGraphStore.subscribe((state, prev) => {
+  if (state.nodes !== prev.nodes) syncFrozenNodes();
 });

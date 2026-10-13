@@ -12,6 +12,7 @@ from pathlib import PurePath
 from typing import Any
 
 from ..schemas import Graph, GraphNode
+from . import presets
 
 MAX_TASKS = 200
 MAX_VARIANTS = 5
@@ -27,9 +28,9 @@ OUTPUT_TYPE = {
     "theme": "image",
     "palette": "palette",
     "collection": "assetList",
-    "extract": "extracted",  # an Extract Assets node fills an Input Collection through its "extract" port
     "generate": "generated",
     "output": "image",
+    "extract": "extracted",
 }
 INPUT_PORTS: dict[str, dict[str, tuple[tuple[str, ...], bool]]] = {
     # port id -> (accepted types, multiple)
@@ -43,18 +44,9 @@ INPUT_PORTS: dict[str, dict[str, tuple[tuple[str, ...], bool]]] = {
     "palette": {"image": (("image",), False)},
     "extract": {"image": (("image",), False)},
     "collection": {"in": (("generated",), False), "extract": (("extracted",), False)},
-    "output": {"in": (("generated",), False)},
+    "output": {"in": (("generated",), False), "edit": (("image", "assetList"), False)},
 }
 
-ROLE_RANK = {"main": 0, "style": 1, "constraints": 2, "output": 3}
-PRESERVE_LABELS = {
-    "mainSubject": "main subject",
-    "silhouette": "silhouette",
-    "shape": "shape",
-    "proportions": "proportions",
-    "composition": "composition",
-    "objectCount": "object count",
-}
 THEME_ROLE_LABELS = {
     "artStyle": "art style",
     "lighting": "lighting",
@@ -64,23 +56,10 @@ THEME_ROLE_LABELS = {
     "composition": "composition",
     "texture": "textures",
 }
-BACKGROUND_TEXT = {
-    "white": "plain white background",
-    "transparent": "transparent background if possible, otherwise a plain flat background",
-}
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 PLACEHOLDERS = ("asset_name", "asset_index", "collection_name", "variant_index")
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
-# A whole game screen (screenshot or mockup) is re-themed without changing how it plays.
-GAME_SCREEN = "Game Screen"
-GAME_SCREEN_TEXT = (
-    "Game screen: the original is a complete game screen, not a single asset. Re-theme the whole screen but keep the "
-    "gameplay identical: the same layout and grid, the same number of objects in the same positions, sizes and grouping, "
-    "every UI/HUD element (counters, timers, buttons, badges, labels) in its place and readable, and the same text and "
-    "numbers. Only the visual style, colours and materials change; do not add, remove, merge or move gameplay elements."
-)
-GAME_SCREEN_PRESERVE = ["composition", "objectCount"]
 # "Match original" picks the closest supported preset to the original image's shape.
 MATCH_ASPECT = "match"
 ASPECT_PRESETS = {"1:1": 1.0, "3:4": 3 / 4, "4:3": 4 / 3, "9:16": 9 / 16, "16:9": 16 / 9}
@@ -115,8 +94,6 @@ class Source:
     name: str
     node_id: str
     collection_name: str | None = None
-    preserve: list[str] = field(default_factory=list)
-    instructions: str = ""
     override: str = ""
 
 
@@ -134,6 +111,9 @@ class TaskPlan:
     aspect_ratio: str = "1:1"  # resolved per task when the setting is "Match original"
     # Manual count with several originals: the primary is the main one; these are sent along with it.
     extra_original_asset_ids: list[str] = field(default_factory=list)
+    # Several Prompt nodes: each one gets its own full set of tasks (1-based).
+    prompt_number: int = 1
+    prompt_count: int = 1
 
 
 @dataclass
@@ -199,10 +179,10 @@ def validate_edges(graph: Graph, errors: list[str]) -> None:
             errors.append(f"'{_title(src)}' cannot connect to the {e.targetHandle} port of '{_title(dst)}'.")
         if src.type == "collection" and src.data.get("role") != "input":
             errors.append(f"Only an Input Collection can feed a Generate node ('{_title(src)}').")
-        if dst.type == "collection" and e.targetHandle == "in" and dst.data.get("role") != "output":
-            errors.append(f"Generated results can only go to an Output Collection ('{_title(dst)}').")
-        if dst.type == "collection" and e.targetHandle == "extract" and dst.data.get("role") != "input":
-            errors.append(f"Extracted assets can only go to an Input Collection ('{_title(dst)}').")
+        if dst.type == "collection":
+            role = "input" if e.targetHandle == "extract" else "output"
+            if dst.data.get("role") != role:
+                errors.append(f"This connection needs an {role} collection ('{_title(dst)}').")
         key = (e.source, e.sourceHandle, e.target, e.targetHandle)
         if key in seen:
             errors.append(f"Duplicate connection into '{_title(dst)}'.")
@@ -284,6 +264,11 @@ def build_plan(
     validate_edges(graph, errors)
     resolver = _Resolver(errors)
 
+    preset = str(d.get("preset") or presets.DEFAULT_PRESET)
+    if preset not in presets.TEMPLATES:
+        errors.append("Choose a preset on the Generate node: Game screen restyle or Asset sheet.")
+        preset = presets.DEFAULT_PRESET
+
     def asset_ok(asset_id: Any, owner: str) -> bool:
         if not isinstance(asset_id, str) or not asset_id:
             errors.append(f"'{owner}' has no image.")
@@ -297,45 +282,27 @@ def build_plan(
             return False
         return True
 
-    # --- Prompts (spec §5.5): role order, then the per-node order field, then connection order.
-    prompts = [n for n in _connected(graph, gen.id, "prompt") if n.data.get("enabled", True)]
-    prompts.sort(key=lambda n: (ROLE_RANK.get(str(n.data.get("role")), 9), n.data.get("order") or 0))
+    # --- The user request: every enabled Prompt node's text, in connection order.
     prompt_parts: list[str] = []
-    for n in prompts:
-        for key in ("text", "constraints"):
-            text = str(n.data.get(key) or "").strip()
-            if text:
-                resolver.check_names(text, f"'{_title(n)}'")
-                prompt_parts.append(text if key == "text" else f"Constraints: {text}")
+    for n in _connected(graph, gen.id, "prompt"):
+        if not n.data.get("enabled", True):
+            continue
+        text = str(n.data.get("text") or "").strip()
+        if text:
+            resolver.check_names(text, f"'{_title(n)}'")
+            prompt_parts.append(text)
     if not prompt_parts:
         errors.append("Connect an enabled Prompt node with text to the Generate node.")
+    selection = str(d.get("assetSelection") or "").strip()[:500]
 
     # --- Originals, flattened in connection order (spec §13.1 step 2).
-    # Game-asset settings live on the Prompt node; the first prompt in compile order decides. Older graphs
-    # kept them on the Generate node, so fall back to it when the prompt has none.
-    ga = next((n.data for n in prompts if "assetCategory" in n.data), d)
-    is_screen = ga.get("assetCategory") == GAME_SCREEN
-    gen_preserve = [k for k, on in (("mainSubject", ga.get("preserveSubject")), ("silhouette", ga.get("preserveSilhouette"))) if on]
-    if is_screen:
-        gen_preserve += GAME_SCREEN_PRESERVE
     sources: list[Source] = []
     original_nodes = _connected(graph, gen.id, "original")
     for n in original_nodes:
         if n.type != "collection":
             if not asset_ok(n.data.get("assetId"), _title(n)):
                 continue
-            own = [k for k, on in (n.data.get("preserve") or {}).items() if on]  # Output nodes have none
-            instructions = str(n.data.get("instructions") or "").strip()
-            resolver.check_names(instructions, f"'{_title(n)}'")
-            sources.append(
-                Source(
-                    asset_id=n.data["assetId"],
-                    name=stem(assets[n.data["assetId"]].name),
-                    node_id=n.id,
-                    preserve=list(dict.fromkeys(gen_preserve + own)),
-                    instructions=instructions,
-                )
-            )
+            sources.append(Source(asset_id=n.data["assetId"], name=stem(assets[n.data["assetId"]].name), node_id=n.id))
         else:
             for item in n.data.get("items") or []:
                 if not item.get("enabled", True):
@@ -347,11 +314,9 @@ def build_plan(
                 sources.append(
                     Source(
                         asset_id=item["assetId"],
-                        # An item may carry its own label (the same image listed once per asset to redraw).
-                        name=str(item.get("label") or "").strip()[:80] or stem(assets[item["assetId"]].name),
+                        name=stem(assets[item["assetId"]].name),
                         node_id=n.id,
                         collection_name=_title(n),
-                        preserve=list(gen_preserve),
                         override=override,
                     )
                 )
@@ -400,12 +365,11 @@ def build_plan(
         elif original_nodes and not errors:
             errors.append("The connected originals have no enabled images to generate from.")
         layout = [(chosen, 1 if chosen else None, v) for v in range(1, count + 1)]
-    if is_screen and not any(s for s, _, _ in layout):
-        errors.append("Game Screen needs an original image: connect the screen to re-theme to the Original port.")
-    if d.get("aspectRatio") == MATCH_ASPECT and not any(s for s, _, _ in layout):
-        errors.append("Aspect ratio 'Match original' needs an original image. Pick a fixed aspect ratio instead.")
-    if len(layout) > MAX_TASKS:
-        errors.append(f"This would create {len(layout)} tasks; the limit is {MAX_TASKS}. Split the batch into smaller ones.")
+    if not any(s for s, _, _ in layout) and not original_nodes:
+        errors.append(f"{presets.LABELS[preset]} needs an original image: connect it to the Original port.")
+    total_tasks = len(layout) * max(1, len(prompt_parts))
+    if total_tasks > MAX_TASKS:
+        errors.append(f"This would create {total_tasks} tasks; the limit is {MAX_TASKS}. Split the batch into smaller ones.")
 
     # Manual count sends every connected original (the primary first); Match inputs sends one per task.
     has_original = any(s for s, _, _ in layout)
@@ -417,19 +381,16 @@ def build_plan(
             "Remove some Original, Theme or Reference images."
         )
 
+    if d.get("outputFormat", "png") not in ("png", "webp", "jpg"):
+        errors.append("Output format must be PNG, WebP or JPG.")
     settings = {
         "model": str(d.get("model") or ""),
-        "aspect_ratio": d.get("aspectRatio", "1:1"),
+        "preset": "result_edit" if d.get("editResult") is True else preset,
+        "asset_selection": selection,
+        "aspect_ratio": d.get("aspectRatio", "match" if preset == presets.SCREEN else "1:1"),
         "quality": d.get("quality", "auto"),
         "output_format": d.get("outputFormat", "png"),
-        "background": d.get("background", "white"),
-        "background_value": str(d.get("backgroundValue") or ""),
-        "asset_category": ga.get("assetCategory", "Other"),
     }
-    art_style = str(ga.get("artStyle") or "").strip()
-    resolver.check_names(art_style, "the art style instructions")
-    if settings["background"] == "custom":
-        resolver.check_names(settings["background_value"], "the background prompt")
 
     if errors:
         raise PlanError(list(dict.fromkeys(errors)))
@@ -442,7 +403,9 @@ def build_plan(
     ref_notes = [str(n.data.get("notes") or "").strip() for n in refs]
 
     tasks: list[TaskPlan] = []
-    for slot, (source, source_index, variant) in enumerate(layout):
+    # Every enabled Prompt node gets the full layout (originals x variants / outputs), prompt by prompt.
+    jobs = [(number, text, entry) for number, text in enumerate(prompt_parts, 1) for entry in layout]
+    for slot, (prompt_number, prompt_text, (source, source_index, variant)) in enumerate(jobs):
         values = {
             "asset_name": source.name if source else None,
             "asset_index": str(source_index) if source_index else None,
@@ -450,77 +413,46 @@ def build_plan(
             "variant_index": str(variant),
         }
         fill = lambda text: resolver.fill(text, values)  # noqa: E731
-        sections: list[str] = ["\n\n".join(fill(p) for p in prompt_parts)]
+        user_prompt = fill(prompt_text)
+        edit_result = d.get("editResult") is True
+        text = presets.render_edit(user_prompt) if edit_result else presets.render(preset, user_prompt, selection)
 
-        if source:  # 2. Batch asset identity
-            where = f' from the collection "{source.collection_name}"' if source.collection_name else ""
-            sections.append(f"Asset: {source.name}{where}.")
-
+        # What else is attached, and how the images are numbered (the template names image 1 only).
         extras = [s for s in sources if s is not source] if (mode != "match" and source) else []
+        original_noun = "the image to edit" if edit_result else presets.ORIGINAL_NOUN[preset]
+        notes = [f"- Attached image 1 is {original_noun}."]
         next_image = 1
-        if source:  # 3. Original image instructions
-            text = "Original image: attached image 1 is the original asset to transform."
-            if source.preserve:
-                text += " Preserve its " + _join([PRESERVE_LABELS.get(k, k) for k in source.preserve]) + "."
-            if source.instructions:
-                text += " " + fill(source.instructions)
-            if extras:
-                text += (
-                    f" Additional originals: {_images_phrase(2, len(extras))} also provided as original assets"
-                    " (secondary); use them together with image 1."
-                )
-            sections.append(text)
+        if source:
             next_image = 2 + len(extras)
-
-        if theme_ids:  # 4. Theme references
+            if extras:
+                notes.append(
+                    f"- Additional originals: {_images_phrase(2, len(extras))} also provided as originals (secondary); "
+                    "use them together with image 1."
+                )
+        if theme_ids:
             follow = _join(theme_labels) if theme_labels else "overall look"
-            text = f"Theme references: {_images_phrase(next_image, len(theme_ids))} style references. Follow their {follow}."
-            text += "".join(f" {note}" for note in theme_notes if note)
-            if source:
-                text += " Do not copy their subjects."
-            sections.append(text)
+            line = f"- Style references: {_images_phrase(next_image, len(theme_ids))} style references. Follow their {follow}."
+            line += "".join(f" {note}" for note in theme_notes if note)
+            notes.append(line + " Do not copy their subjects.")
             next_image += len(theme_ids)
         if ref_ids:
-            text = f"Visual references: {_images_phrase(next_image, len(ref_ids))} general visual references."
-            text += "".join(f" {note}" for note in ref_notes if note)
-            sections.append(text)
-
-        if palette:  # 5. Color palette
+            line = f"- Visual references: {_images_phrase(next_image, len(ref_ids))} general visual references."
+            notes.append(line + "".join(f" {note}" for note in ref_notes if note))
+        if palette:
             colors = [
                 f"{c['role']} {c['hex']}" + (f" (about {c['ratio']}%)" if isinstance(c.get("ratio"), (int, float)) else "")
                 for c in palette
             ]
-            sections.append("Color palette: use " + ", ".join(colors) + ".")
-
-        game = [f"Game asset type: {settings['asset_category']}."]  # 6. Game asset constraints
-        if art_style:
-            game.append(f"Art style: {fill(art_style)}")
-        if is_screen:
-            game.append(GAME_SCREEN_TEXT)
-        elif ga.get("consistentFraming"):
-            game.append("Single centered subject with consistent margins.")
-        if ga.get("consistentScale") and not is_screen:
-            game.append("Keep a consistent visual scale across the set.")
-        sections.append(" ".join(game))
-
-        if source and source.override:  # 7. Per-asset override
-            sections.append(f"For this asset: {fill(source.override)}")
-
-        background = settings["background"]  # 8. Output instructions
-        if is_screen and background != "custom":
-            # A screen keeps its own full-bleed background; white/transparent would break it.
-            bg_text = "the screen's own full-bleed background, restyled to the new theme"
-        elif background == "solid":
-            bg_text = f"solid {settings['background_value'].strip() or 'single-color'} background"
-        elif background == "custom":
-            bg_text = fill(settings["background_value"].strip()) or "simple background"
-        else:
-            bg_text = BACKGROUND_TEXT.get(background, "simple background")
+            notes.append("- Color palette: use " + ", ".join(colors) + ".")
+        if source and source.override:
+            notes.append(f"- For this image: {fill(source.override)}")
         aspect = settings["aspect_ratio"]
         if aspect == MATCH_ASPECT and source:
             meta = assets[source.asset_id]
             aspect = closest_aspect(meta.width, meta.height)
-        sections.append(f"Output: aspect ratio {aspect}, {bg_text}.")
+        elif aspect != MATCH_ASPECT:
+            notes.append(f"- Requested output aspect ratio: {aspect}. This overrides any aspect-ratio rule above.")
+        text += "\n\nADDITIONAL INPUTS\n" + "\n".join(notes)
 
         tasks.append(
             TaskPlan(
@@ -528,13 +460,15 @@ def build_plan(
                 variant_index=variant,
                 source=source,
                 source_index=source_index,
-                prompt="\n\n".join(s for s in sections if s.strip()),
-                operation="edit" if (source or theme_ids or ref_ids) else "generate",
+                prompt=text,
+                operation="edit",
                 original_asset_id=source.asset_id if source else None,
                 theme_asset_ids=list(theme_ids),
                 reference_asset_ids=list(ref_ids),
                 aspect_ratio=aspect,
                 extra_original_asset_ids=[s.asset_id for s in extras],
+                prompt_number=prompt_number,
+                prompt_count=len(prompt_parts),
             )
         )
 

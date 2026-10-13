@@ -4,6 +4,8 @@ import type { NodeKind } from '../graph/types';
 
 /** Line icons per node type (paths adapted from Lucide, ISC licence). */
 const PATHS: Record<NodeKind, ReactNode> = {
+  text: <path d="M4 5h16M12 5v15M8 20h8" />,
+  drawing: <path d="m4 16-1 5 5-1L21 7l-4-4L4 16ZM14 6l4 4" />,
   prompt: <path d="M4 7V4h16v3M9 20h6M12 4v16" />,
   image: (
     <>

@@ -54,7 +54,8 @@ class PlanBody(BaseModel):
 
 class RetryBody(BaseModel):
     # Omitted: retry every failed or interrupted task. Given: new attempts for exactly these tasks.
-    task_ids: list[str] | None = None
+    task_ids: list[str] | None = Field(default=None, min_length=1, max_length=200)
+    prompt: str | None = Field(default=None, max_length=200_000)
 
 
 def _project(conn: sqlite3.Connection, project_id: str) -> None:
@@ -128,6 +129,7 @@ async def preview(body: PlanBody, conn: Conn, settings: Cfg, registry: Registry)
             {
                 "slot_index": t.slot_index,
                 "variant_index": t.variant_index,
+                "prompt_number": t.prompt_number,
                 "source_asset_id": t.original_asset_id,
                 "extra_original_asset_ids": t.extra_original_asset_ids,
                 "source_name": t.source.name if t.source else None,
@@ -197,6 +199,7 @@ async def create(body: PlanBody, conn: Conn, settings: Cfg, registry: Registry, 
                             "theme_asset_ids": t.theme_asset_ids,
                             "reference_asset_ids": t.reference_asset_ids,
                             "settings": {**plan.settings, "aspect_ratio": t.aspect_ratio},
+                            **({"prompt_number": t.prompt_number, "prompt_count": t.prompt_count} if t.prompt_count > 1 else {}),
                         }
                     ),
                     ts,
@@ -329,7 +332,7 @@ async def retry(batch_id: str, body: RetryBody, conn: Conn, engine: Engine) -> d
         unknown = [t for t in body.task_ids if t not in latest]
         if unknown:
             raise ApiError(400, "INVALID_INPUT", "Only the latest attempt of a task can be retried.")
-        targets = [latest[t] for t in body.task_ids]
+        targets = [latest[t] for t in dict.fromkeys(body.task_ids)]
         if any(r["status"] in ACTIVE_TASK for r in targets):
             raise ApiError(409, "TASK_ACTIVE", "A selected task is still queued or running.")
     if not targets:
@@ -344,7 +347,7 @@ async def retry(batch_id: str, body: RetryBody, conn: Conn, engine: Engine) -> d
                 "INSERT INTO generation_tasks (id, batch_id, source_asset_id, variant_index, status, prompt_snapshot,"
                 " provider_request_json, attempt_number, created_at, slot_index, source_name)"
                 " VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
-                (new_id, batch_id, r["source_asset_id"], r["variant_index"], r["prompt_snapshot"], r["provider_request_json"],
+                (new_id, batch_id, r["source_asset_id"], r["variant_index"], (body.prompt or '').strip() or r["prompt_snapshot"], r["provider_request_json"],
                  r["attempt_number"] + 1, ts, r["slot_index"], r["source_name"]),
             )
         _requeue(conn, batch_id)

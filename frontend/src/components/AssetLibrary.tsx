@@ -8,6 +8,8 @@ import { useAssetStore } from '../store/assetStore';
 import { useGraphStore } from '../store/graphStore';
 import { MiniThumb } from './AssetThumb';
 import { ASSET_DRAG_MIME } from './Canvas';
+import { ContextMenu } from './ContextMenu';
+import { IconAction } from './IconAction';
 
 type Filter = 'all' | 'upload' | 'generated' | 'unused';
 
@@ -31,6 +33,7 @@ export function AssetLibrary() {
   const [filter, setFilter] = useState<Filter>('all');
   const [selected, setSelected] = useState<string[]>([]);
   const [anchor, setAnchor] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; targets: AssetInfo[] } | null>(null);
 
   const used = useMemo(() => usedAssetIds(nodes), [nodes]);
   const visible = useMemo(() => {
@@ -76,8 +79,8 @@ export function AssetLibrary() {
     e.dataTransfer.effectAllowed = 'copy';
   };
 
-  const remove = async () => {
-    const ids = selectedAssets.map((a) => a.id);
+  const remove = async (targets: AssetInfo[] = selectedAssets) => {
+    const ids = targets.map((a) => a.id);
     const graph = useGraphStore.getState();
     try {
       const deleted = await useAssetStore.getState().remove(ids);
@@ -89,10 +92,18 @@ export function AssetLibrary() {
     }
   };
 
-  const place = (group: boolean) => {
-    const message = placeAssets(selectedAssets, { group });
+  const place = (group: boolean, targets: AssetInfo[] = selectedAssets) => {
+    const message = placeAssets(targets, { group });
     if (message) useGraphStore.getState().showToast(`${message}.`);
     setSelected([]);
+  };
+
+  // Right-click acts on the whole selection when the tile is part of it, otherwise on that tile alone.
+  const onContextMenu = (e: MouseEvent, asset: AssetInfo) => {
+    e.preventDefault();
+    const targets = selectedSet.has(asset.id) ? selectedAssets : [asset];
+    setSelected(targets.map((a) => a.id));
+    setMenu({ x: e.clientX, y: e.clientY, targets });
   };
 
   return (
@@ -106,14 +117,9 @@ export function AssetLibrary() {
           onChange={(e) => setQuery(e.target.value)}
           className="min-w-0 flex-1 rounded-md border border-line bg-panel-2 px-2 py-1 text-[12px] outline-none placeholder:text-ink-3 focus:border-focus"
         />
-        <button
-          type="button"
-          className={smallBtn}
-          title="Store images in the project without placing them on the canvas"
+        <IconAction icon="import" label="Import images"
           onClick={() => void pickImageFiles(true).then((files) => importImages(files, { place: false }))}
-        >
-          Import
-        </button>
+        />
       </div>
       <div role="radiogroup" aria-label="Filter assets" className="flex flex-wrap gap-1">
         {FILTERS.map((f) => (
@@ -151,11 +157,7 @@ export function AssetLibrary() {
           </button>
         </div>
       ) : (
-        <p className="px-0.5 text-[11px] leading-snug text-ink-3">
-          {assets.length === 0
-            ? 'No images yet. Import some, or drop them on the canvas.'
-            : 'Drag onto the canvas, a node or a collection. Ctrl/Shift+click to select several; double-click to preview.'}
-        </p>
+        <>{assets.length === 0 && <p className="text-[12px] text-ink-3">No images yet.</p>}</>
       )}
 
       {visible.length === 0 && assets.length > 0 && <p className="px-0.5 text-[12px] text-ink-3">No matching images.</p>}
@@ -171,6 +173,7 @@ export function AssetLibrary() {
                 draggable
                 onDragStart={(e) => onDragStart(e, a)}
                 onClick={(e) => onClick(e, a)}
+                onContextMenu={(e) => onContextMenu(e, a)}
                 onDoubleClick={() => useAssetStore.getState().setPreview(a.id)}
                 aria-pressed={isSelected}
                 title={`${a.name}\n${a.width}×${a.height} · ${a.format}${uses ? `\nUsed ${uses}×` : '\nNot used on the canvas'}`}
@@ -190,6 +193,21 @@ export function AssetLibrary() {
           );
         })}
       </ul>
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          title={menu.targets.length === 1 ? menu.targets[0].name : `${menu.targets.length} images`}
+          onClose={() => setMenu(null)}
+          items={[
+            ...(menu.targets.length === 1
+              ? [{ label: 'Preview', onSelect: () => useAssetStore.getState().setPreview(menu.targets[0].id) }]
+              : []),
+            { label: 'Add as nodes', onSelect: () => place(false, menu.targets) },
+            { label: menu.targets.length === 1 ? 'Delete image' : `Delete ${menu.targets.length} images`, danger: true, onSelect: () => void remove(menu.targets) },
+          ]}
+        />
+      )}
     </div>
   );
 }

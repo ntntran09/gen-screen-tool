@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { OUT } from '../graph/registry';
 import type { CollectionData } from '../graph/types';
-import { api } from '../lib/api';
+import { api, toGraphPayload, toInlineGenerationPayload, type AssetInfo } from '../lib/api';
+import { EXTRACT_PROMPT } from './graphStore';
 import { useGraphStore } from './graphStore';
 
 const s = () => useGraphStore.getState();
@@ -11,6 +12,7 @@ function select(ids: string[]) {
 }
 
 beforeEach(() => {
+  s().setTool('select');
   s().loadProject({
     id: 'p',
     name: 'Test',
@@ -22,6 +24,98 @@ beforeEach(() => {
 });
 
 describe('graph store', () => {
+  it('does not move a drawing when an eraser drag emits a node position change', () => {
+    const id = s().addNode('drawing', { x: 40, y: 50 }, { points: [{ x: 3, y: 3 }, { x: 30, y: 20 }] });
+    s().setTool('eraser');
+    s().onNodesChange([{ type: 'position', id, position: { x: 400, y: 500 }, dragging: true }]);
+    expect(s().nodes.find((n) => n.id === id)?.position).toEqual({ x: 40, y: 50 });
+    s().setTool('select');
+    s().onNodesChange([{ type: 'position', id, position: { x: 400, y: 500 }, dragging: true }]);
+    expect(s().nodes.find((n) => n.id === id)?.position).toEqual({ x: 400, y: 500 });
+  });
+  it('resizes text horizontally while keeping height automatic through persistence and undo', () => {
+    const id = s().addNode('text', { x: 0, y: 0 }, { text: 'A wrapping comment', comment: true });
+    s().commit();
+    s().onNodesChange([{ type: 'dimensions', id, dimensions: { width: 140, height: 300 }, setAttributes: true }]);
+    expect(s().nodes.find((n) => n.id === id)?.width).toBe(140);
+    expect(s().nodes.find((n) => n.id === id)?.height).toBeUndefined();
+    expect(toGraphPayload(s().nodes, s().edges, s().viewport).nodes[0]).toMatchObject({ width: 140, height: null });
+    s().undo();
+    expect(s().nodes.find((n) => n.id === id)?.width).toBeUndefined();
+  });
+  it('saves annotations and reuses the eraser with undo/redo', () => {
+    const text = s().addNode('text', { x: 20, y: 30 }, { text: 'Review this', color: '#4c8df6' });
+    const drawing = s().addNode('drawing', { x: 40, y: 50 }, { points: [{ x: 3, y: 3 }, { x: 30, y: 20 }], canvasWidth: 33, canvasHeight: 23 });
+    const saved = toGraphPayload(s().nodes, s().edges, s().viewport);
+    expect(saved.nodes.map((n) => n.type)).toEqual(['text', 'drawing']);
+    expect(s().eraseItems({ nodeIds: [text, drawing] })).toBe(0);
+    expect(s().nodes).toHaveLength(0);
+    s().undo();
+    expect(s().nodes.map((n) => n.id)).toEqual([text, drawing]);
+    s().redo();
+    expect(s().nodes).toHaveLength(0);
+  });
+  it('creates only a directly connected result and stores the inline prompt on its source', () => {
+    const source = s().addNode('output', { x: 0, y: 0 }, { assetId: 'result' });
+    const generate = s().placeInlineResult(source, 'result', 'Change only the background', 'new-batch', { providerId: 'fake' });
+    expect(generate).toBeTruthy();
+    expect(s().nodes).toHaveLength(2);
+    expect(s().nodes.every((n) => n.type === 'output')).toBe(true);
+    expect(s().edges[0]).toMatchObject({ source, target: s().nodes[1].id, targetHandle: 'edit' });
+    expect(s().nodes[0].data.inlineGeneration).toMatchObject({ prompt: 'Change only the background', batchIds: ['new-batch'] });
+    s().undo();
+    expect(s().nodes).toHaveLength(1);
+    expect(s().edges).toHaveLength(0);
+    s().redo();
+    expect(s().edges).toHaveLength(1);
+  });
+
+  it('references only the selected collection asset without placing helper nodes', () => {
+    const source = s().addNode('collection', { x: 0, y: 0 }, { role: 'output', items: [
+      { id: 'a', assetId: 'a', enabled: true, promptOverride: '' },
+      { id: 'b', assetId: 'b', enabled: true, promptOverride: '' },
+    ] });
+    s().placeInlineResult(source, 'b', 'Make it pink', 'new-batch');
+    expect(s().nodes).toHaveLength(2);
+    expect(s().nodes[0].data.inlineGeneration?.assetId).toBe('b');
+    expect(s().nodes.some((n) => n.type === 'image' || n.type === 'generate' || n.type === 'prompt')).toBe(false);
+    const snapshot = toInlineGenerationPayload(toGraphPayload(s().nodes, s().edges, s().viewport), source);
+    expect(snapshot.nodes.find((n) => n.type === 'image')?.data.assetId).toBe('b');
+    expect(s().nodes).toHaveLength(2);
+  });
+
+  it('a copied inline control gets independent history and identity', () => {
+    const source = s().addNode('output', { x: 0, y: 0 }, { assetId: 'result' });
+    const id = s().placeInlineResult(source, 'result', 'Make it pink', 'batch');
+    select([source]);
+    s().copySelected();
+    s().paste();
+    const copy = s().nodes.find((n) => n.selected)!;
+    expect(copy.data.inlineGeneration?.id).not.toBe(id);
+    expect(copy.data.inlineGeneration?.batchIds).toEqual([]);
+    expect(copy.data.inlineGeneration?.prompt).toBe('Make it pink');
+  });
+
+  it('expands selected outputs without removing collection contents; one undo step', () => {
+    const id = s().addNode('collection', { x: 0, y: 0 }, { role: 'output', items: [
+      { id: 'a', assetId: 'asset-a', enabled: false, promptOverride: '' },
+      { id: 'b', assetId: 'asset-b', enabled: true, promptOverride: '' },
+    ] });
+    s().expandCollection(id, ['a']);
+    expect(s().nodes).toHaveLength(2);
+    expect(s().nodes[1].data.assetId).toBe('asset-a');
+    expect((s().nodes[0].data as CollectionData).items).toHaveLength(2);
+    s().undo();
+    expect(s().nodes).toHaveLength(1);
+  });
+
+  it('refuses collection edits and expansion when locked', () => {
+    const id = s().addNode('collection', { x: 0, y: 0 }, { locked: true });
+    s().setCollectionItems(id, [{ id: 'a', assetId: 'a', enabled: true, promptOverride: '' }]);
+    s().expandCollection(id);
+    expect(s().nodes).toHaveLength(1);
+    expect((s().nodes[0].data as CollectionData).items).toHaveLength(0);
+  });
   it('adds nodes with default data and undoes/redoes', () => {
     const id = s().addNode('prompt', { x: 10, y: 20 });
     expect(s().nodes).toHaveLength(1);
@@ -142,87 +236,115 @@ describe('extraction workflow', () => {
     return { src, ex };
   };
   const get = (id: string) => s().nodes.find((n) => n.id === id)!;
-  const itemsOf = (id: string) => (get(id).data as { items: { assetId: string; label: string; promptOverride: string }[] }).items;
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'cropAssets').mockImplementation(async (_id, boxes) => ({
+      assets: boxes.map((box, i) => ({ id: `crop-${i}-${box.name}`, name: `${box.name}.png` }) as AssetInfo),
+    }));
+  });
 
-  it('lists the full original once per ticked asset, with its own label and instruction, and builds the redraw nodes', () => {
-    const { ex } = found([1]); // the pause button is unticked
+  it('crops ticked boxes into a collection and queues one background removal per crop', async () => {
+    const { ex } = found([1]);
     const before = s().nodes.length;
-    const made = s().addExtractionWorkflow(ex)!;
-    expect(made.count).toBe(2);
-    expect(s().nodes).toHaveLength(before + 3); // collection, prompt, generate
-
-    const items = itemsOf(made.collection);
-    expect(items.map((i) => [i.assetId, i.label])).toEqual([['screen', 'blue pot'], ['screen', 'cat']]); // always the full image
-    expect(items[0].promptOverride).toContain('"blue pot"');
-    expect(items[0].promptOverride).toContain('top left'); // where it is, in words
-    expect(items[0].promptOverride).toContain('10-30% across'); // and roughly
-    expect(items[0].promptOverride).not.toMatch(/[{}]/); // braces would read as placeholders
-    expect(items[1].promptOverride).toContain('bottom left');
-    expect(get(made.collection).data).toMatchObject({ role: 'input', title: 'Assets to redraw' });
-
-    expect((get(made.prompt!).data as { text: string }).text).toContain('{asset_name}');
-    expect(get(made.prompt!).data).toMatchObject({ preserveSubject: false, preserveSilhouette: false });
-    expect(get(made.generate!).data).toMatchObject({ mode: 'match', aspectRatio: '1:1', background: 'transparent' });
-    const wires = s().edges.map((e) => [e.source, e.target, e.targetHandle]);
-    expect(wires).toEqual(
-      expect.arrayContaining([
-        [ex, made.collection, 'extract'],
-        [made.prompt, made.generate, 'prompt'],
-        [made.collection, made.generate, 'original'],
-      ]),
-    );
-    s().undo(); // all of it is one undo step
+    const made = (await s().addExtractionWorkflow(ex))!;
+    expect(api.cropAssets).toHaveBeenCalledWith('screen', [
+      { name: 'blue pot', x: .1, y: .1, w: .2, h: .2 },
+      { name: 'cat', x: 0, y: .85, w: .2, h: .15 },
+    ]);
+    expect(s().nodes).toHaveLength(before + 3);
+    expect((get(made.collection).data as CollectionData).items.map((i) => i.assetId)).toEqual(['crop-0-blue pot', 'crop-1-cat']);
+    expect(get(made.prompt!).data.text).toBe(EXTRACT_PROMPT);
+    const cropItems = (get(made.collection).data as CollectionData).items;
+    expect(cropItems[0].promptOverride).toContain('Target asset: "blue pot"');
+    expect(cropItems[0].promptOverride).toContain('a pot with blue flowers');
+    expect(cropItems[0].promptOverride).not.toMatch(/[{}]/);
+    expect(cropItems[1].promptOverride).toContain('Target asset: "cat"');
+    expect(get(made.generate).data).toMatchObject({ preset: 'assets', mode: 'match', variantsPerInput: 1, aspectRatio: 'match' });
+    expect(s().edges.map((e) => [e.source, e.target, e.targetHandle])).toEqual(expect.arrayContaining([
+      [ex, made.collection, 'extract'], [made.collection, made.generate, 'original'], [made.prompt, made.generate, 'prompt'],
+    ]));
+    s().undo();
     expect(s().nodes).toHaveLength(before);
+    expect(get(ex).data.collectionNodeId).toBeNull();
   });
 
-  it('pressing it again refreshes the list but does not add a second prompt and generate', () => {
+  it('reuses collection and Generate while preserving edited art direction', async () => {
     const { ex } = found();
-    const first = s().addExtractionWorkflow(ex)!;
-    const nodes = s().nodes.length;
-    s().updateNodeData(ex, { off: [0, 1] }); // now only the cat
-    const again = s().addExtractionWorkflow(ex)!;
-    expect(again.collection).toBe(first.collection);
-    expect(again.generate).toBeNull();
-    expect(s().nodes).toHaveLength(nodes);
-    expect(itemsOf(first.collection).map((i) => i.label)).toEqual(['cat']);
+    const first = (await s().addExtractionWorkflow(ex))!;
+    const count = s().nodes.length;
+    s().updateNodeData(first.prompt!, { text: 'Remove bg, keep shadows.' });
+    s().updateNodeData(ex, { off: [0, 1] });
+    const again = (await s().addExtractionWorkflow(ex))!;
+    expect(again).toMatchObject({ collection: first.collection, generate: first.generate, created: false });
+    expect(s().nodes).toHaveLength(count);
+    expect((get(first.collection).data as CollectionData).items).toHaveLength(1);
+    expect(get(first.prompt!).data.text).toBe('Remove bg, keep shadows.');
   });
 
-  it('does nothing without a current search, with everything unticked, or into a locked collection', () => {
-    expect(s().addExtractionWorkflow('missing')).toBeNull();
-    expect(s().addExtractionWorkflow(s().addNode('image', { x: 0, y: 0 }))).toBeNull();
-    const lonely = s().addNode('extract', { x: 0, y: 600 });
-    expect(s().addExtractionWorkflow(lonely)).toBeNull(); // nothing found yet
+  it('refreshes the previously generated default removal prompt', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    s().updateNodeData(made.prompt!, { text: 'Remove the background from this cropped asset. Keep only the main asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. Do not restyle, add other objects or create multiple copies. Return one isolated asset.' });
+    await s().addExtractionWorkflow(ex);
+    expect(get(made.prompt!).data.text).toBe(EXTRACT_PROMPT);
+  });
 
+  it('refuses stale, empty, locked and frozen workflows without cropping', async () => {
     const { ex, src } = found([0, 1, 2]);
-    expect(s().addExtractionWorkflow(ex)).toBeNull(); // all unticked
-
+    expect(await s().addExtractionWorkflow(ex)).toBeNull();
     s().updateNodeData(ex, { off: [] });
-    const made = s().addExtractionWorkflow(ex)!;
+    const made = (await s().addExtractionWorkflow(ex))!;
+    vi.mocked(api.cropAssets).mockClear();
     s().updateNodeData(made.collection, { locked: true });
-    expect(s().addExtractionWorkflow(ex)).toBeNull();
-    expect(s().toast?.tone).toBe('error');
-
-    s().updateNodeData(src, { assetId: 'another' }); // the image changed: the search is stale
+    expect(await s().addExtractionWorkflow(ex)).toBeNull();
     s().updateNodeData(made.collection, { locked: false });
-    expect(s().addExtractionWorkflow(ex)).toBeNull();
+    s().setFrozen([made.generate]);
+    expect(await s().addExtractionWorkflow(ex)).toBeNull();
+    s().setFrozen([]);
+    s().updateNodeData(src, { assetId: 'changed' });
+    expect(await s().addExtractionWorkflow(ex)).toBeNull();
+    expect(api.cropAssets).not.toHaveBeenCalled();
   });
 
-  it('the Assets port only reaches an Input Collection, never a Generate node directly', () => {
-    const { ex } = found();
-    const g = s().addNode('generate', { x: 600, y: 0 });
-    s().connect({ source: ex, sourceHandle: OUT, target: g, targetHandle: 'original' });
-    expect(s().edges.some((e) => e.target === g)).toBe(false);
-    expect(s().toast?.tone).toBe('error');
-    const outCol = s().addNode('collection', { x: 600, y: 300 }, { role: 'output' });
-    s().connect({ source: ex, sourceHandle: OUT, target: outCol, targetHandle: 'extract' });
-    expect(s().edges.some((e) => e.target === outCol)).toBe(false); // an Output Collection hides that port
+  it('does not overwrite the canvas after an image or project changes during cropping', async () => {
+    const { ex, src } = found();
+    let finish!: (value: { assets: AssetInfo[] }) => void;
+    vi.mocked(api.cropAssets).mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    const pending = s().addExtractionWorkflow(ex);
+    s().updateNodeData(src, { assetId: 'changed' });
+    finish({ assets: [{ id: 'late' } as AssetInfo] });
+    expect(await pending).toBeNull();
+    expect(s().nodes).toHaveLength(2);
+    s().updateNodeData(src, { assetId: 'screen' });
+    const next = s().addExtractionWorkflow(ex);
+    useGraphStore.setState({ projectId: 'other-project', nodes: [], edges: [] });
+    finish({ assets: [{ id: 'late' } as AssetInfo] });
+    expect(await next).toBeNull();
+    expect(s().nodes).toHaveLength(0);
   });
 
-  it('deleting the image empties every slot that listed it', () => {
+  it('crop failures leave the graph unchanged', async () => {
     const { ex } = found();
-    const made = s().addExtractionWorkflow(ex)!;
-    expect(s().clearAssetRefs(['screen'])).toBe(4); // 3 list items + the source Image node
-    expect(itemsOf(made.collection)).toHaveLength(0);
+    const before = s().nodes;
+    vi.mocked(api.cropAssets).mockRejectedValue(new Error('Source missing'));
+    await expect(s().addExtractionWorkflow(ex)).rejects.toThrow('Source missing');
+    expect(s().nodes).toBe(before);
+  });
+
+  it('copied workflows keep their own collection and Generate references', async () => {
+    const { ex, src } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    select([ex, src, made.collection, made.prompt!, made.generate]);
+    s().copySelected(); s().paste();
+    const copied = s().nodes.filter((n) => n.selected);
+    const copiedExtract = copied.find((n) => n.type === 'extract')!;
+    const copiedCollection = copied.find((n) => n.type === 'collection')!;
+    expect(copiedExtract.data.collectionNodeId).toBe(copiedCollection.id);
+    expect(copiedExtract.data.generateNodeId).toBe(copied.find((n) => n.type === 'generate')!.id);
+    s().updateNodeData(copiedExtract.id, { off: [0, 1] });
+    await s().addExtractionWorkflow(copiedExtract.id);
+    expect((get(copiedCollection.id).data as CollectionData).items).toHaveLength(1);
+    expect((get(made.collection).data as CollectionData).items).toHaveLength(3);
   });
 });
 
@@ -253,14 +375,16 @@ describe('one-connection ports', () => {
 });
 
 describe('frozen while generating', () => {
-  it('freezes a Generate node: not draggable/deletable/connectable, edges kept, until released', () => {
+  it('allows moving a generating node while keeping deletion and connections frozen until released', () => {
     const p = s().addNode('prompt', { x: 0, y: 0 });
     const g = s().addNode('generate', { x: 300, y: 0 });
     const other = s().addNode('prompt', { x: 0, y: 300 });
     s().connect({ source: p, sourceHandle: OUT, target: g, targetHandle: 'prompt' });
     s().setFrozen([g]);
     const gen = () => s().nodes.find((n) => n.id === g)!;
-    expect([gen().draggable, gen().deletable, gen().connectable]).toEqual([false, false, false]);
+    expect([gen().draggable, gen().deletable, gen().connectable]).toEqual([true, false, false]);
+    s().onNodesChange([{ type: 'position', id: g, position: { x: 500, y: 120 } }]);
+    expect(gen().position).toEqual({ x: 500, y: 120 });
     expect(s().nodes.find((n) => n.id === p)!.deletable).toBe(true);
 
     // The eraser and Delete leave it, and its connections, alone.
@@ -420,7 +544,7 @@ describe('image nodes', () => {
     const items = (col.data as { items: { assetId: string; promptOverride: string; enabled: boolean }[] }).items;
     // Reading order: b (x=0) before a (x=200); locked and empty nodes are left out.
     expect(items.map((i) => i.assetId)).toEqual(['asset-b', 'asset-a']);
-    expect(items[1].promptOverride).toBe('keep the hat');
+    expect(items[1].promptOverride).toBe('');
     expect(items.every((i) => i.enabled)).toBe(true);
     expect(s().nodes.map((n) => n.id).sort()).toEqual([c, empty, t, g].sort());
     expect(s().edges).toEqual([expect.objectContaining({ source: c, target: g, targetHandle: 'original' })]);
@@ -449,7 +573,7 @@ describe('image nodes', () => {
     s().ungroupCollection(c);
     const originals = s().nodes.filter((n) => n.type === 'image');
     expect(originals.map((n) => n.data.assetId)).toEqual(['a1', 'a2']);
-    expect(originals[0].data.instructions).toBe('red');
+    expect(originals[0].data.instructions).toBeUndefined();
     expect(s().edges.filter((e) => e.target === g && e.targetHandle === 'original')).toHaveLength(2);
     expect(s().nodes.some((n) => n.id === c)).toBe(false);
   });

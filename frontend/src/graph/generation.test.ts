@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractedCollection, generateNeedsOriginal, originalEdgeRoles } from './generation';
+import { attachResults, estimateTasks, originalEdgeRoles, resultActionFor } from './generation';
 import { getDefinition } from './registry';
 import type { CanvasEdge, CanvasNode, NodeKind } from './types';
 
@@ -11,6 +11,46 @@ const wire = (source: string, handle = 'original'): CanvasEdge => ({
   sourceHandle: 'out',
   target: 'g',
   targetHandle: handle,
+});
+
+it('multiplies the expected images by the enabled prompts that have text', () => {
+  const nodes = [
+    node('g', 'generate', { mode: 'manual', outputCount: 3 }),
+    node('p1', 'prompt', { text: 'a' }),
+    node('p2', 'prompt', { text: 'b' }),
+    node('p3', 'prompt', { text: '  ' }),
+    node('p4', 'prompt', { text: 'd', enabled: false }),
+  ];
+  const edges = ['p1', 'p2', 'p3', 'p4'].map((id) => wire(id, 'prompt'));
+  expect(estimateTasks(nodes, edges, 'g')).toBe(6);
+  expect(estimateTasks(nodes, [], 'g')).toBe(3);
+});
+
+it('identifies the active action by source and batch after the prompt panel closes or results are renamed', () => {
+  const nodes = [
+    node('retry', 'output', { sourceNodeId: 'source', generationId: 'old-batch', resultAction: 'retry' }),
+    node('variation', 'output', { sourceNodeId: 'source', generationId: 'new-batch', resultAction: 'variation', title: 'Renamed' }),
+    node('other', 'output', { sourceNodeId: 'other-source', generationId: 'new-batch', resultAction: 'retry' }),
+  ];
+  expect(resultActionFor(nodes, 'source', 'new-batch')).toBe('variation');
+  expect(resultActionFor(nodes, 'source', 'old-batch')).toBe('retry');
+  expect(resultActionFor(nodes, 'other-source', 'new-batch')).toBe('retry');
+  expect(resultActionFor(nodes, 'missing', 'new-batch')).toBeNull();
+});
+
+it('regenerated outputs ignore older attempts and other slots after reload', () => {
+  const nodes = [node('old', 'output', { assetId: 'old-image', generationId: 'b', taskId: 't1' }),
+    node('new', 'output', { generationId: 'b', pendingSlot: 1, pendingAttempt: 2 })];
+  const tasks = [
+    { id: 't1', batch_id: 'b', slot_index: 1, attempt_number: 1, status: 'completed', output_asset_id: 'old-image' },
+    { id: 't2', batch_id: 'b', slot_index: 0, attempt_number: 2, status: 'completed', output_asset_id: 'other-slot' },
+    { id: 't3', batch_id: 'b', slot_index: 1, attempt_number: 2, status: 'completed', output_asset_id: 'new-image' },
+  ];
+  const result = attachResults(nodes, tasks);
+  expect(result[0].data.assetId).toBe('old-image');
+  expect(result[1].data.assetId).toBe('new-image');
+  expect(result[1].data.taskId).toBe('t3');
+  expect(attachResults(result, tasks)).toBe(result);
 });
 
 describe('originalEdgeRoles', () => {
@@ -44,33 +84,5 @@ describe('originalEdgeRoles', () => {
       const roles = originalEdgeRoles([...images, node('g', 'generate', { mode: 'manual', primaryOriginalNodeId: primary })], edges, 'g');
       expect([...roles.values()]).toEqual(['candidate', 'candidate']);
     }
-  });
-});
-
-describe('generateNeedsOriginal', () => {
-  const promptWire = { id: 'pw', source: 'p', sourceHandle: 'out', target: 'g', targetHandle: 'prompt' } as CanvasEdge;
-
-  it('is false for plain text-to-image in Manual count', () => {
-    const nodes = [node('p', 'prompt'), node('g', 'generate', { mode: 'manual', aspectRatio: '1:1' })];
-    expect(generateNeedsOriginal(nodes, [promptWire], 'g')).toBe(false);
-  });
-
-  it('is true for Match inputs, Match original aspect, or a Game Screen prompt', () => {
-    expect(generateNeedsOriginal([node('g', 'generate', { mode: 'match' })], [], 'g')).toBe(true);
-    expect(generateNeedsOriginal([node('g', 'generate', { mode: 'manual', aspectRatio: 'match' })], [], 'g')).toBe(true);
-    const screen = [node('p', 'prompt', { assetCategory: 'Game Screen' }), node('g', 'generate', { mode: 'manual', aspectRatio: '1:1' })];
-    expect(generateNeedsOriginal(screen, [promptWire], 'g')).toBe(true);
-    expect(generateNeedsOriginal(screen, [], 'g')).toBe(false); // that prompt is not connected
-  });
-});
-
-describe('extractedCollection', () => {
-  const link = (source: string, target: string, handle: string) => ({ id: `${source}-${target}`, source, sourceHandle: 'out', target, targetHandle: handle }) as CanvasEdge;
-
-  it('finds the collection on the Assets port, and nothing for a node without one', () => {
-    const nodes = [node('x', 'extract'), node('c', 'collection', { role: 'input' }), node('other', 'collection')];
-    expect(extractedCollection(nodes, [link('x', 'c', 'extract')], 'x')?.id).toBe('c');
-    expect(extractedCollection(nodes, [link('x', 'c', 'in')], 'x')).toBeNull(); // wrong port
-    expect(extractedCollection(nodes, [], 'x')).toBeNull();
   });
 });

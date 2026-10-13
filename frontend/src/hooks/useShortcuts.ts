@@ -15,7 +15,7 @@ export function isTypingTarget(target: EventTarget | null): boolean {
   return false;
 }
 
-export function useShortcuts(saveNow: () => void) {
+export function useShortcuts(saveNow: () => void | Promise<void>) {
   const { fitView, zoomIn, zoomOut } = useReactFlow();
 
   useEffect(() => {
@@ -26,7 +26,7 @@ export function useShortcuts(saveNow: () => void) {
       // Save works everywhere, including while typing.
       if (mod && key === 's') {
         e.preventDefault();
-        saveNow();
+        void Promise.resolve(saveNow()).catch(() => {});
         return;
       }
       if (isTypingTarget(e.target)) return;
@@ -62,8 +62,8 @@ export function useShortcuts(saveNow: () => void) {
       } else if (!mod && e.shiftKey && key === '2') {
         const selected = s.nodes.filter((n) => n.selected);
         if (selected.length) void fitView({ nodes: selected, padding: 0.3, duration: 200 });
-      } else if (!mod && !e.shiftKey && !e.altKey && (key === 'v' || key === 'h' || key === 'e')) {
-        s.setTool(key === 'v' ? 'select' : key === 'h' ? 'pan' : 'eraser');
+      } else if (!mod && !e.shiftKey && !e.altKey && ['v', 'h', 'e', 't', 'p'].includes(key)) {
+        s.setTool(key === 'v' ? 'select' : key === 'h' ? 'pan' : key === 'e' ? 'eraser' : key === 't' ? 'text' : 'draw');
       } else if (!mod && e.key === 'Escape' && s.tool !== 'select') {
         s.setTool('select');
       } else if (!mod && (e.key === '+' || e.key === '=')) {

@@ -1,15 +1,16 @@
 import { NodeIcon } from './NodeIcon';
+import { IconAction, ActionGlyph } from './IconAction';
+import { OutputActions } from './OutputActions';
+import { OutputPlaceholder } from './OutputPlaceholder';
 import { nanoid } from 'nanoid';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { getDefinition, LIMITS } from '../graph/registry';
 import {
   ASPECT_RATIOS,
-  ASSET_CATEGORIES,
-  GAME_SCREEN,
+  PRESETS,
   aspectLabel,
   COLOR_ROLES,
-  PRESERVATION_OPTIONS,
   THEME_ROLES,
   type AnyNodeData,
   type CanvasNode,
@@ -20,6 +21,7 @@ import {
   type OutputData,
   type PaletteData,
   type PromptData,
+  type NodeDataByKind,
 } from '../graph/types';
 import { nodeAssetId } from '../graph/collections';
 import { useImageImport } from '../hooks/useImageImport';
@@ -35,15 +37,6 @@ import { AssetThumb, formatBytes } from './AssetThumb';
 import { ExtractFields } from './ExtractFields';
 import { Button, NumberInput, Section, Select, TextArea, TextInput, Toggle } from './fields';
 
-const PRESERVE_LABELS: Record<(typeof PRESERVATION_OPTIONS)[number], string> = {
-  composition: 'Composition',
-  shape: 'Shape',
-  proportions: 'Proportions',
-  silhouette: 'Silhouette',
-  mainSubject: 'Main subject',
-  objectCount: 'Object count',
-};
-
 const THEME_LABELS: Record<(typeof THEME_ROLES)[number], string> = {
   artStyle: 'Art style',
   lighting: 'Lighting',
@@ -58,77 +51,28 @@ const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 
 type Update = (patch: Partial<AnyNodeData>) => void;
 
-function PromptFields({ nodeId, data, update }: { nodeId: string; data: PromptData; update: Update }) {
-  const generateIds = useGraphStore(
-    useShallow((s) => s.edges.filter((e) => e.source === nodeId && e.targetHandle === 'prompt').map((e) => e.target)),
-  );
-  const setCategory = (assetCategory: PromptData['assetCategory']) => {
-    update({ assetCategory });
-    // A screen is almost always a full screenshot: switch the fed Generate nodes to the original's shape.
-    if (assetCategory === GAME_SCREEN && data.assetCategory !== GAME_SCREEN) {
-      const { updateNodeData } = useGraphStore.getState();
-      for (const id of generateIds) updateNodeData(id, { aspectRatio: 'match' });
-    }
-  };
+function PromptFields({ data, update }: { data: PromptData; update: Update }) {
   return (
-    <>
-      <Section title="Game asset" note="If several prompts feed one Generate node, the first one (by role, then order) sets these.">
-        <Select
-          label="Asset type"
-          value={data.assetCategory}
-          options={ASSET_CATEGORIES}
-          onChange={setCategory}
-          hint={
-            data.assetCategory === GAME_SCREEN
-              ? 'Connect a full screenshot as the Original. The result re-themes the whole screen but keeps layout, object count and positions, UI and text.'
-              : undefined
-          }
-        />
-        <TextArea label="Art style" rows={2} value={data.artStyle} onChange={(artStyle) => update({ artStyle })} placeholder="e.g. soft 3D, glossy, pastel winter" />
-        <div className="grid grid-cols-2 gap-2">
-          <Toggle label="Keep subject" checked={data.preserveSubject} onChange={(preserveSubject) => update({ preserveSubject })} hint="Ask the AI to keep the original's main subject" />
-          <Toggle label="Keep silhouette" checked={data.preserveSilhouette} onChange={(preserveSilhouette) => update({ preserveSilhouette })} hint="Ask the AI to keep the original's outline" />
-          {data.assetCategory !== GAME_SCREEN && (
-            <>
-              <Toggle label="Centered framing" checked={data.consistentFraming} onChange={(consistentFraming) => update({ consistentFraming })} hint="One centered object with even margins" />
-              <Toggle label="Same scale" checked={data.consistentScale} onChange={(consistentScale) => update({ consistentScale })} hint="Keep objects the same size across a set" />
-            </>
-          )}
-        </div>
-      </Section>
-      <Section title="Prompt">
-        <TextArea
-          label="Main prompt"
-          rows={6}
-          value={data.text}
-          onChange={(text) => update({ text })}
-          placeholder="Repaint {asset_name} into a polished 3D casual mobile game asset…"
-          hint={
-            <>
-              Variables: <code>{'{asset_name}'}</code> <code>{'{asset_index}'}</code> <code>{'{collection_name}'}</code>{' '}
-              <code>{'{variant_index}'}</code>
-            </>
-          }
-        />
-        <TextArea label="Constraints" rows={3} value={data.constraints} onChange={(constraints) => update({ constraints })} />
-        <Select
-          label="Role"
-          value={data.role}
-          options={[
-            { value: 'main', label: 'Main description' },
-            { value: 'style', label: 'Art style' },
-            { value: 'constraints', label: 'Constraints' },
-            { value: 'output', label: 'Output requirements' },
-          ]}
-          onChange={(role) => update({ role })}
-        />
-        <NumberInput label="Order" value={data.order} min={0} max={99} onChange={(order) => update({ order })} />
-        <Toggle label="Enabled" checked={data.enabled} onChange={(enabled) => update({ enabled })} />
-        <Button onClick={() => void copyText(data.text)} disabled={!data.text}>
-          Copy prompt
-        </Button>
-      </Section>
-    </>
+    <Section
+      title=""
+      note="Fills the {{USER_PROMPT}} slot of the preset on the Generate node. Put any art direction notes here too."
+    >
+      <TextArea
+        label="Prompt"
+        action={<IconAction icon="copy" label="Copy prompt" onClick={() => void copyText(data.text)} disabled={!data.text} />}
+        rows={8}
+        value={data.text}
+        onChange={(text) => update({ text })}
+        placeholder="e.g. Change it to a wool crochet style."
+        hint={
+          <>
+            Variables: <code>{'{asset_name}'}</code> <code>{'{asset_index}'}</code> <code>{'{collection_name}'}</code>{' '}
+            <code>{'{variant_index}'}</code>
+          </>
+        }
+      />
+      <Toggle label="Enabled" checked={data.enabled} onChange={(enabled) => update({ enabled })} />
+    </Section>
   );
 }
 
@@ -136,7 +80,7 @@ function gcd(a: number, b: number): number {
   return b === 0 ? a : gcd(b, a % b);
 }
 
-function AssetNameField({ assetId, name }: { assetId: string; name: string }) {
+function AssetNameField({ assetId, name, compact = false }: { assetId: string; name: string; compact?: boolean }) {
   const [draft, setDraft] = useState(name);
   useEffect(() => setDraft(name), [name]);
   const commit = () => {
@@ -157,13 +101,13 @@ function AssetNameField({ assetId, name }: { assetId: string; name: string }) {
       onChange={setDraft}
       onBlur={commit}
       onEnter={commit}
-      hint="Display name only. The stored file is never renamed or overwritten."
+      hint={compact ? undefined : 'Display name only. The stored file is never renamed or overwritten.'}
     />
   );
 }
 
 /** Preview, file facts and actions for the image a node points at (spec §6.3–6.4). */
-function AssetPanel({ nodeId, assetId, canReplace }: { nodeId: string; assetId: string | null; canReplace: boolean }) {
+function AssetPanel({ nodeId, assetId, canReplace, actions, compact = false }: { nodeId: string; assetId: string | null; canReplace: boolean; actions?: ReactNode; compact?: boolean }) {
   const asset = useAssetStore((s) => (assetId ? s.assets[assetId] : undefined));
   const importImages = useImageImport();
   const choose = async () => {
@@ -174,6 +118,7 @@ function AssetPanel({ nodeId, assetId, canReplace }: { nodeId: string; assetId: 
 
   return (
     <div className="space-y-3">
+      {actions}
       <button
         type="button"
         className="block w-full disabled:cursor-default"
@@ -185,7 +130,10 @@ function AssetPanel({ nodeId, assetId, canReplace }: { nodeId: string; assetId: 
       </button>
       {asset && (
         <>
-          <AssetNameField assetId={asset.id} name={asset.name} />
+          {compact && <p className="text-[11px] text-ink-2">{asset.width} × {asset.height} · {asset.format} · {formatBytes(asset.file_size)}</p>}
+          <details open={compact ? undefined : true}>
+            <summary className={compact ? 'cursor-pointer text-[12px] text-ink-2' : 'hidden'}>File</summary>
+            <AssetNameField assetId={asset.id} name={asset.name} compact={compact} />
           <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
             <dt className="text-ink-3">Resolution</dt>
             <dd>
@@ -204,25 +152,23 @@ function AssetPanel({ nodeId, assetId, canReplace }: { nodeId: string; assetId: 
               {asset.origin === 'upload' ? asset.original_filename : asset.origin}
             </dd>
           </dl>
+          </details>
         </>
       )}
-      <div className="flex flex-wrap gap-2">
-        {canReplace && <Button onClick={() => void choose()}>{assetId ? 'Replace image' : 'Choose image'}</Button>}
+      {!compact && <div className="flex flex-wrap gap-2">
+        {canReplace && <IconAction icon="image" label={assetId ? 'Replace image' : 'Choose image'} onClick={() => void choose()} />}
         {asset && !asset.missing && (
           <>
-            <Button onClick={() => useAssetStore.getState().setPreview(asset.id)}>View full size</Button>
-            <a
+                        <a
               href={assetUrls.download(asset.id)}
-              className="rounded-md border border-line px-2.5 py-1.5 text-[12px] text-ink-2 hover:bg-panel-2 hover:text-ink"
+              className="inline-flex size-8 items-center justify-center rounded-md text-ink-2 hover:bg-panel-2 hover:text-ink" title="Download" aria-label="Download"
             >
-              Download
+              <ActionGlyph icon="download" />
             </a>
           </>
         )}
-      </div>
-      {assetId && canReplace && (
-        <p className="text-[11px] text-ink-3">Replacing keeps the old file; this node just points at the new one.</p>
-      )}
+      </div>}
+
     </div>
   );
 }
@@ -242,7 +188,6 @@ function ImageFields({ nodeId, data, update }: { nodeId: string; data: ImageData
         <AssetPanel nodeId={nodeId} assetId={data.assetId} canReplace={!data.locked} />
         <TextArea label="Notes" rows={2} value={data.notes} onChange={(notes) => update({ notes })} hint="Sent with Theme and Reference images." />
       </Section>
-      {roles.includes('Original') && <OriginalFields data={data} update={update} />}
       {roles.includes('Theme') && <ThemeFields data={data} update={update} />}
     </>
   );
@@ -265,7 +210,9 @@ function GenerationFacts({ batchId, taskId }: { batchId: string | null; taskId: 
   if (!task) return null;
   const r = task.result;
   return (
-    <Section title="Generation">
+    <details className="border-b border-line px-4 py-3">
+      <summary className="cursor-pointer text-[12px] text-ink-2">Generation</summary>
+      <div className="mt-3 space-y-3">
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
         <dt className="text-ink-3">Batch</dt>
         <dd className="truncate">{batch?.name ?? '—'}</dd>
@@ -284,7 +231,7 @@ function GenerationFacts({ batchId, taskId }: { batchId: string | null; taskId: 
         )}
         <dt className="text-ink-3">Requested</dt>
         <dd>
-          {task.request.settings.aspect_ratio} · {task.request.settings.quality} · {task.request.settings.background}
+          {task.request.settings.aspect_ratio} · {task.request.settings.quality}
         </dd>
         {r && (
           <>
@@ -304,25 +251,22 @@ function GenerationFacts({ batchId, taskId }: { batchId: string | null; taskId: 
           {task.prompt}
         </pre>
       </details>
-    </Section>
+      </div>
+    </details>
   );
 }
 
 function OutputFields({ node }: { node: CanvasNode }) {
   const data = node.data as OutputData;
-  const addNode = useGraphStore((s) => s.addNode);
-  // Non-destructive: the result stays where it is and a new node references the same file.
-  const addAsImage = () => addNode('image', { x: node.position.x + 260, y: node.position.y }, { assetId: data.assetId });
   return (
     <>
-      <Section title="Result" note={data.assetId ? undefined : 'Waiting for the generation to finish.'}>
+      <Section title="" note={data.assetId ? undefined : 'Waiting for the generation to finish.'}>
         {data.assetId ? (
           <>
-            <AssetPanel nodeId={node.id} assetId={data.assetId} canReplace={false} />
-            <Button onClick={addAsImage}>Copy to a new Image node</Button>
-            <p className="text-[11px] text-ink-3">You can also connect this result straight into a Generate port.</p>
+            <AssetPanel nodeId={node.id} assetId={data.assetId} canReplace={false} compact
+              actions={<OutputActions key={`${node.id}:${data.assetId}`} nodeId={node.id} assetId={data.assetId} batchId={data.generationId} taskId={data.taskId} />} />
           </>
-        ) : null}
+        ) : <OutputPlaceholder data={data} />}
       </Section>
       <GenerationFacts batchId={data.generationId} taskId={data.taskId} />
     </>
@@ -375,24 +319,6 @@ function OutputBatchRow({ batchId }: { batchId: string }) {
   );
 }
 
-function OriginalFields({ data, update }: { data: ImageData; update: Update }) {
-  return (
-    <Section title="As original" note="These become prompt instructions, not pixel-level guarantees.">
-      <div className="grid grid-cols-2 gap-2">
-        {PRESERVATION_OPTIONS.map((key) => (
-          <Toggle
-            key={key}
-            label={PRESERVE_LABELS[key]}
-            checked={Boolean(data.preserve?.[key])}
-            onChange={(on) => update({ preserve: { ...data.preserve, [key]: on } })}
-          />
-        ))}
-      </div>
-      <TextArea label="Extra instructions" rows={2} value={data.instructions} onChange={(instructions) => update({ instructions })} />
-    </Section>
-  );
-}
-
 function ThemeFields({ data, update }: { data: ImageData; update: Update }) {
   return (
     <Section title="As theme">
@@ -410,79 +336,30 @@ function ThemeFields({ data, update }: { data: ImageData; update: Update }) {
   );
 }
 
-const PALETTE_ROLES: PaletteData['colors'][number]['role'][] = ['primary', 'secondary', 'accent'];
-
-/** Pull dominant colours out of an image: the connected one, or any image in the library (no AI, no quota). */
+/** Pull dominant colours from the connected image. */
 function ExtractPalette({ nodeId, data, update }: { nodeId: string; data: PaletteData; update: Update }) {
-  const assets = useAssetStore(useShallow((s) => Object.values(s.assets).filter((a) => !a.missing)));
-  const sourceTitle = useGraphStore((s) => {
+  const connectedAssetId = useGraphStore((s) => {
     const e = s.edges.find((x) => x.target === nodeId && x.targetHandle === 'image');
     const src = e && s.nodes.find((n) => n.id === e.source);
-    return src && nodeAssetId(src) ? String(src.data.title) : null;
+    return src ? nodeAssetId(src) : null;
   });
-  const [assetId, setAssetId] = useState('');
   const [busy, setBusy] = useState(false);
   const count = data.extractCount ?? 5;
-  const chosen = assets.find((a) => a.id === assetId) ?? assets[0];
 
   const fromConnection = async () => {
     setBusy(true);
     await useGraphStore.getState().extractPalette(nodeId, count);
     setBusy(false);
   };
-  const fromLibrary = async (mode: 'replace' | 'add') => {
-    if (!chosen) return;
-    setBusy(true);
-    try {
-      const { colors } = await api.assetPalette(chosen.id, count);
-      const fresh = colors.map((c, i) => ({
-        id: nanoid(8),
-        hex: c.hex,
-        role: PALETTE_ROLES[i] ?? 'accent',
-        ratio: c.share,
-      }));
-      update({ colors: mode === 'replace' ? fresh : [...data.colors, ...fresh] });
-    } catch (err) {
-      useGraphStore.getState().showToast((err as Error).message, 'error');
-    } finally {
-      setBusy(false);
-    }
-  };
+
+  if (!connectedAssetId) return null;
 
   return (
-    <Section
-      title="Colors from an image"
-      note={
-        sourceTitle
-          ? `Following the connected image "${sourceTitle}": the colors update when you connect or replace it. You can still edit them below.`
-          : 'Connect an Image node to the Image port to take its colors automatically, or pick one from your library.'
-      }
-    >
+    <Section title="Colors from an image">
       <NumberInput label="Number of colors" value={count} min={2} max={8} onChange={(extractCount) => update({ extractCount })} />
-      {sourceTitle ? (
         <Button variant="primary" disabled={busy} onClick={() => void fromConnection()}>
           {busy ? 'Reading…' : 'Re-read connected image'}
         </Button>
-      ) : assets.length === 0 ? (
-        <p className="text-[12px] text-ink-3">Add an image to the project first.</p>
-      ) : (
-        <>
-          <Select
-            label="Library image"
-            value={chosen?.id ?? ''}
-            options={assets.map((a) => ({ value: a.id, label: a.name }))}
-            onChange={setAssetId}
-          />
-          <div className="flex gap-2">
-            <Button variant="primary" disabled={busy} onClick={() => void fromLibrary('replace')}>
-              {busy ? 'Extracting…' : 'Replace colors'}
-            </Button>
-            <Button disabled={busy} onClick={() => void fromLibrary('add')}>
-              Add to colors
-            </Button>
-          </div>
-        </>
-      )}
     </Section>
   );
 }
@@ -498,7 +375,6 @@ function PaletteFields({ nodeId, data, update }: { nodeId: string; data: Palette
   };
   return (
     <>
-      <ExtractPalette nodeId={nodeId} data={data} update={update} />
       <Section title="Colors" note="Converted to color instructions; exact pixel colors are not guaranteed.">
         <ul className="space-y-2">
           {data.colors.map((c, i) => (
@@ -543,14 +419,11 @@ function PaletteFields({ nodeId, data, update }: { nodeId: string; data: Palette
           ))}
         </ul>
         <div className="flex gap-2">
-          <Button onClick={() => update({ colors: [...data.colors, { id: nanoid(8), hex: '#FFFFFF', role: 'accent', ratio: null }] })}>
-            Add color
-          </Button>
-          <Button onClick={() => void copyText(data.colors.map((c) => c.hex).join(', '))} disabled={data.colors.length === 0}>
-            Copy HEX
-          </Button>
+          <IconAction icon="add" label="Add color" onClick={() => update({ colors: [...data.colors, { id: nanoid(8), hex: '#FFFFFF', role: 'accent', ratio: null }] })} />
+          <IconAction icon="copy" label="Copy HEX" onClick={() => void copyText(data.colors.map((c) => c.hex).join(', '))} disabled={data.colors.length === 0} />
         </div>
       </Section>
+      <ExtractPalette nodeId={nodeId} data={data} update={update} />
     </>
   );
 }
@@ -565,6 +438,19 @@ function CollectionFields({ nodeId, data, update }: { nodeId: string; data: Coll
   return (
     <>
       <Section title="Collection">
+        <div className="flex flex-wrap gap-2">
+          <IconAction icon="preview" label="Open collection" onClick={() => useAssetStore.getState().openViewer(nodeId)} />
+          {data.role === 'output' && items.length > 0 && <IconAction icon="expand" label="Expand to nodes" onClick={() => useGraphStore.getState().expandCollection(nodeId)} />}
+          {canAdd && (
+            <IconAction icon="add" label="Add images" onClick={() => void pickImageFiles(true).then((files) => importImages(files, { collectionNodeId: nodeId }))} />
+          )}
+          {canAdd && items.length > 0 && (
+            <IconAction icon="expand" label="Ungroup" onClick={() => ungroup(nodeId)} />
+          )}
+        </div>
+        <details className="text-[12px] text-ink-2">
+          <summary className="cursor-pointer">Advanced</summary>
+          <div className="mt-3 space-y-3">
         <Select
           label="Type"
           value={data.role}
@@ -588,22 +474,9 @@ function CollectionFields({ nodeId, data, update }: { nodeId: string; data: Coll
             </>
           )}
         </dl>
-        <div className="flex flex-wrap gap-2">
-          <Button onClick={() => useAssetStore.getState().openViewer(nodeId)}>Open viewer</Button>
-          {canAdd && (
-            <Button
-              onClick={() =>
-                void pickImageFiles(true).then((files) => importImages(files, { collectionNodeId: nodeId }))
-              }
-            >
-              Add images
-            </Button>
-          )}
-          {canAdd && items.length > 0 && (
-            <Button onClick={() => ungroup(nodeId)}>Ungroup</Button>
-          )}
-        </div>
-        {canAdd && <p className="text-[11px] text-ink-3">Ungroup turns every image into its own Original node.</p>}
+          </div>
+        </details>
+
       </Section>
       {data.role === 'output' && <OutputBatches batchIds={data.batchIds ?? []} />}
     </>
@@ -611,6 +484,7 @@ function CollectionFields({ nodeId, data, update }: { nodeId: string; data: Coll
 }
 
 function GenerateFields({ id, data, update }: { id: string; data: GenerateData; update: Update }) {
+  const starting = useGenerationStore((s) => !!s.starting[id]);
   // Select the store's own node objects: useShallow compares items by identity, so mapping to
   // fresh objects inside the selector would never compare equal and re-render forever.
   const originalNodes = useGraphStore(
@@ -643,23 +517,55 @@ function GenerateFields({ id, data, update }: { id: string; data: GenerateData; 
 
   return (
     <>
-      <Section title="Run" note="Generation starts only when you press Generate on the node.">
-        <Button onClick={() => useGenerationStore.getState().openPreview(id)}>Preview request</Button>
-        {batches.length > 0 && (
-          <ul className="space-y-1 text-[12px] text-ink-2">
-            {batches.map((b) => (
-              <li key={b.id}>
-                <span className="text-ink-3">{new Date(b.created_at).toLocaleTimeString()}</span> ·{' '}
-                {b.status.replace('_', ' ')} · {b.completed_count}/{b.expected_count}
-                {b.failed_count > 0 && <span className="text-danger"> · {b.failed_count} failed</span>}
-              </li>
-            ))}
-          </ul>
+      <Section
+        title=""
+        note={data.editResult ? 'Edits the connected result using the Prompt. Unspecified details stay the same.' : 'Your Prompt fills the selected template; Palette, Theme and Reference images are added to it.'}
+      >
+        <Select
+          label="Preset"
+          value={data.editResult ? 'result_edit' : data.preset}
+          options={[...(data.editResult ? [{ value: 'result_edit', label: 'Edit result' }] : []), ...PRESETS.map((p) => ({ value: p.id, label: p.label }))]}
+          onChange={(preset) => update(preset === 'result_edit' ? { editResult: true } : { editResult: false, preset, ...(preset === 'screen' ? { aspectRatio: 'match' } : {}) })}
+          hint={PRESETS.find((p) => p.id === data.preset)?.description}
+        />
+        {!data.editResult && data.preset === 'assets' && (
+          <TextArea
+            label="Assets"
+            rows={3}
+            value={data.assetSelection}
+            onChange={(assetSelection) => update({ assetSelection })}
+            placeholder="e.g. pots, flowers, ice and number badges"
+            hint="Leave empty to let the AI pick the distinct assets. The Extract Assets node can fill this in for you."
+          />
         )}
       </Section>
-      <Section title="Mode">
+      <Section title="Image" note="The AI treats these as requests, not guarantees. Each result shows the size it actually came back with.">
         <Select
-          label="Generation mode"
+          label="Aspect ratio"
+          value={data.aspectRatio}
+          options={ASPECT_RATIOS.map((a) => ({ value: a, label: aspectLabel(a) }))}
+          onChange={(aspectRatio) => update({ aspectRatio })}
+          hint={data.aspectRatio === 'match' ? 'Uses the shape closest to each original image (a phone screenshot → 9:16).' : undefined}
+        />
+        <Select
+          label="Quality"
+          value={data.quality}
+          options={[
+            { value: 'auto', label: 'Auto' },
+            { value: 'low', label: 'Low' },
+            { value: 'medium', label: 'Medium' },
+            { value: 'high', label: 'High' },
+          ]}
+          onChange={(quality) => update({ quality })}
+        />
+        <Select label="File format" value={data.outputFormat}
+          options={[{ value: 'png', label: 'PNG' }, { value: 'webp', label: 'WebP (lossless)' }, { value: 'jpg', label: 'JPG' }]}
+          onChange={(outputFormat) => update({ outputFormat })}
+          hint={data.outputFormat === 'jpg' ? 'JPG removes transparency using a white background.' : 'Transparency is preserved when returned by the provider.'} />
+      </Section>
+      <Section title="Outputs">
+        <Select
+          label="Mode"
           value={data.mode}
           options={[
             { value: 'manual', label: 'Manual count' },
@@ -669,7 +575,7 @@ function GenerateFields({ id, data, update }: { id: string; data: GenerateData; 
         />
         {data.mode === 'manual' ? (
           <NumberInput
-            label="Number of outputs"
+            label="Count"
             value={data.outputCount}
             min={1}
             max={LIMITS.maxOutputCount}
@@ -677,7 +583,7 @@ function GenerateFields({ id, data, update }: { id: string; data: GenerateData; 
           />
         ) : (
           <NumberInput
-            label="Variants per original"
+            label="Variants"
             value={data.variantsPerInput}
             min={1}
             max={LIMITS.maxVariantsPerInput}
@@ -698,7 +604,16 @@ function GenerateFields({ id, data, update }: { id: string; data: GenerateData; 
           />
         )}
       </Section>
-      <Section title="Output image" note="The AI treats these as requests, not guarantees. Each result shows the size and background it actually came back with.">
+
+      <Section title="Run">
+        <div className="flex items-center gap-2">
+          <Button variant="primary" disabled={data.locked || starting} onClick={() => void useGenerationStore.getState().start(id)}>{starting ? 'Starting...' : 'Generate'}</Button>
+          <IconAction icon="preview" label="Preview request" onClick={() => useGenerationStore.getState().openPreview(id)} />
+        </div>
+      </Section>
+      <details className="border-b border-line px-4 py-3">
+        <summary className="cursor-pointer text-[12px] text-ink-2">Advanced</summary>
+        <div className="mt-3 space-y-3">
         <Select
           label="Provider"
           value={data.providerId}
@@ -709,45 +624,19 @@ function GenerateFields({ id, data, update }: { id: string; data: GenerateData; 
           ]}
           onChange={(providerId) => update({ providerId })}
         />
-        <Select
-          label="Aspect ratio"
-          value={data.aspectRatio}
-          options={ASPECT_RATIOS.map((a) => ({ value: a, label: aspectLabel(a) }))}
-          onChange={(aspectRatio) => update({ aspectRatio })}
-          hint={data.aspectRatio === 'match' ? 'Uses the shape closest to each original image (a phone screenshot → 9:16).' : undefined}
-        />
-        <Select
-          label="Quality"
-          value={data.quality}
-          options={[
-            { value: 'auto', label: 'Auto' },
-            { value: 'low', label: 'Low (faster)' },
-            { value: 'medium', label: 'Medium' },
-            { value: 'high', label: 'High (slower)' },
-          ]}
-          onChange={(quality) => update({ quality })}
-        />
-        <Select
-          label="Background"
-          value={data.background}
-          options={[
-            { value: 'white', label: 'White' },
-            { value: 'solid', label: 'Solid color' },
-            { value: 'transparent', label: 'Transparent' },
-            { value: 'custom', label: 'Describe it…' },
-          ]}
-          onChange={(background) => update({ background })}
-          hint={data.background === 'transparent' ? 'Requested only; check the result for real transparency.' : undefined}
-        />
-        {(data.background === 'solid' || data.background === 'custom') && (
-          <TextInput
-            label={data.background === 'solid' ? 'Background color' : 'Background description'}
-            value={data.backgroundValue}
-            onChange={(backgroundValue) => update({ backgroundValue })}
-            placeholder={data.background === 'solid' ? 'e.g. light blue' : 'e.g. snowy night sky'}
-          />
+        {batches.length > 0 && (
+          <ul className="space-y-1 text-[12px] text-ink-2">
+            {batches.map((b) => (
+              <li key={b.id}>
+                <span className="text-ink-3">{new Date(b.created_at).toLocaleTimeString()}</span> ·{' '}
+                {b.status.replace('_', ' ')} · {b.completed_count}/{b.expected_count}
+                {b.failed_count > 0 && <span className="text-danger"> · {b.failed_count} failed</span>}
+              </li>
+            ))}
+          </ul>
         )}
-      </Section>
+        </div>
+      </details>
     </>
   );
 }
@@ -774,12 +663,7 @@ export function Inspector() {
             Delete
           </Button>
         </div>
-        {groupable >= 2 && (
-          <p className="text-[11px] text-ink-3">
-            Grouping puts {groupable} images into one Input Collection (Ctrl+G). Connections to a Generate node's Original
-            port move to the collection.
-          </p>
-        )}
+
       </div>
     );
   }
@@ -822,7 +706,24 @@ export function Inspector() {
         />
       </div>
       <fieldset disabled={frozen} className="m-0 min-w-0 border-0 p-0">
-        {node.type === 'prompt' && <PromptFields nodeId={node.id} data={d as PromptData} update={update} />}
+        {node.type === 'text' && <Section title="">
+          <TextArea label="Text" value={(d as NodeDataByKind['text']).text} onChange={(text) => update({ text })} rows={3} />
+          <label className="flex items-center gap-2 text-[11px] text-ink-2">
+            Size
+            <input type="range" aria-label="Text size" min={12} max={72} value={(d as NodeDataByKind['text']).fontSize}
+              onChange={(e) => update({ fontSize: Number(e.target.value) })} className="min-w-0 flex-1 accent-[var(--color-accent)]" />
+            <span className="w-8 text-right tabular-nums">{(d as NodeDataByKind['text']).fontSize}</span>
+          </label>
+          <div className="flex items-center gap-3">
+            <input type="color" aria-label="Text color" value={String(d.color)} onChange={(e) => update({ color: e.target.value })} className="size-8 cursor-pointer" />
+            <Toggle label="Comment" checked={!!(d as NodeDataByKind['text']).comment} onChange={(comment) => update({ comment })} />
+          </div>
+        </Section>}
+        {node.type === 'drawing' && <Section title="">
+          <input type="color" aria-label="Drawing color" value={String(d.color)} onChange={(e) => update({ color: e.target.value })} className="size-8 cursor-pointer" />
+          <NumberInput label="Width" value={(d as NodeDataByKind['drawing']).strokeWidth} min={1} max={12} onChange={(strokeWidth) => update({ strokeWidth })} />
+        </Section>}
+        {node.type === 'prompt' && <PromptFields data={d as PromptData} update={update} />}
         {node.type === 'image' && <ImageFields nodeId={node.id} data={d as ImageData} update={update} />}
         {node.type === 'output' && <OutputFields node={node} />}
         {node.type === 'palette' && <PaletteFields nodeId={node.id} data={d as PaletteData} update={update} />}
@@ -831,17 +732,8 @@ export function Inspector() {
         {node.type === 'generate' && <GenerateFields id={node.id} data={d as GenerateData} update={update} />}
       </fieldset>
       <div className="flex gap-2 px-4 py-4">
-        <Button onClick={duplicateSelected} disabled={frozen}>
-          Duplicate
-        </Button>
-        <Button
-          variant="danger"
-          onClick={deleteSelected}
-          disabled={d.locked || frozen}
-          title={frozen ? 'Generating: delete it when the run ends' : d.locked ? 'Unlock the node to delete it' : undefined}
-        >
-          Delete
-        </Button>
+        <IconAction icon="duplicate" label="Duplicate" onClick={duplicateSelected} disabled={frozen} />
+        <IconAction icon="delete" label="Delete" onClick={deleteSelected} disabled={d.locked || frozen} danger />
       </div>
     </div>
   );
@@ -851,7 +743,7 @@ export function Inspector() {
 function FrozenBanner() {
   return (
     <div role="status" className="border-b-2 border-accent bg-accent-soft px-4 py-2 text-[12px] text-ink">
-      Generating. This node is frozen until the run finishes.
+      Generating.
     </div>
   );
 }

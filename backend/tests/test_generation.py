@@ -89,27 +89,25 @@ def gen(**data: Any) -> dict[str, Any]:
     base = {
         "providerId": "fake",
         "model": "",
+        "preset": "screen",
+        "assetSelection": "",
         "mode": "manual",
         "outputCount": 1,
         "variantsPerInput": 1,
         "aspectRatio": "1:1",
         "quality": "auto",
         "outputFormat": "png",
-        "background": "white",
-        "backgroundValue": "",
-        "assetCategory": "Item",
-        "artStyle": "",
-        "preserveSubject": True,
-        "preserveSilhouette": True,
-        "consistentFraming": True,
-        "consistentScale": False,
         "primaryOriginalNodeId": None,
     }
     return node("g", "generate", **{**base, **data})
 
 
-def prompt(text: str = "A cute potion", id_: str = "p", **data: Any) -> dict[str, Any]:
-    return node(id_, "prompt", **{"text": text, "constraints": "", "enabled": True, "role": "main", "order": 0, **data})
+def orig(id_: str = "orig", asset: str = "a1") -> dict[str, Any]:
+    return node(id_, "image", assetId=asset, notes="", roles=[])
+
+
+def prompt(text: str = "Change it to a crochet style.", id_: str = "p", **data: Any) -> dict[str, Any]:
+    return node(id_, "prompt", **{"text": text, "enabled": True, **data})
 
 
 def graph(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, Any]:
@@ -146,22 +144,52 @@ def collection(id_: str, *asset_ids: str, disabled: tuple[str, ...] = (), overri
 # --- plan: modes and counts ----------------------------------------------------------------------
 
 
-def test_manual_text_to_image_creates_n_tasks() -> None:
-    p = plan(graph([gen(outputCount=3), prompt()], [edge("p", "g", "prompt")]))
+
+def test_manual_count_makes_n_variations_of_the_original() -> None:
+    p = plan(graph([gen(outputCount=3), prompt(), orig()], [edge("p", "g", "prompt"), edge("orig", "g", "original")]))
     assert len(p.tasks) == 3
     assert [t.variant_index for t in p.tasks] == [1, 2, 3]
-    assert all(t.operation == "generate" and t.original_asset_id is None for t in p.tasks)
+    assert all(t.operation == "edit" and t.original_asset_id == "a1" for t in p.tasks)
 
 
-def test_manual_one_original_makes_variations() -> None:
-    g = graph(
-        [gen(outputCount=2), prompt(), node("o", "original", assetId="a1", preserve={"shape": True}, instructions="")],
-        [edge("p", "g", "prompt"), edge("o", "g", "original")],
-    )
+def test_result_edit_uses_current_output_and_change_request_without_restyle_template() -> None:
+    g = graph([gen(editResult=True), prompt("Remove the blue flower only."), node("result", "output", assetId="a2")],
+              [edge("p", "g", "prompt"), edge("result", "g", "original")])
     p = plan(g)
-    assert [t.original_asset_id for t in p.tasks] == ["a1", "a1"]
+    assert len(p.tasks) == 1 and p.tasks[0].original_asset_id == "a2"
     assert p.tasks[0].operation == "edit"
-    assert "Preserve its main subject, silhouette and shape." in p.tasks[0].prompt
+    assert "Remove the blue flower only." in p.tasks[0].prompt
+    assert "Preserve all details" in p.tasks[0].prompt
+    assert "PRESERVE GAMEPLAY AND LAYOUT" not in p.tasks[0].prompt
+    assert "the image to edit" in p.tasks[0].prompt
+    assert p.settings["preset"] == "result_edit"
+
+
+@pytest.mark.parametrize("preset,edit", [("screen", False), ("assets", False), ("screen", True)])
+def test_short_prompt_recovers_the_user_input_and_preserves_full_template(preset, edit) -> None:
+    from app.generation.prompt_parts import split_prompt
+    request = "Make the flowers pink.\nKeep the pots blue."
+    p = plan(graph([gen(preset=preset, editResult=edit, assetSelection="flowers"), prompt(request), orig()],
+                   [edge("p", "g", "prompt"), edge("orig", "g", "original")]))
+    full = p.tasks[0].prompt
+    parts = split_prompt(full, p.settings)
+    assert parts["user_prompt"] == request
+    assert parts["prefix"] + parts["user_prompt"] + parts["suffix"] == full
+    assert "ADDITIONAL INPUTS" in parts["suffix"]
+
+
+@pytest.mark.parametrize("value", [0, 5, 1.5, True, "2", None])
+def test_legacy_concurrency_setting_is_ignored(value) -> None:
+    g = graph([gen(concurrency=value), prompt(), orig()], [edge("p", "g", "prompt"), edge("orig", "g", "original")])
+    assert "concurrency" not in plan(g).settings
+
+
+
+def test_both_presets_need_an_original() -> None:
+    no_original = graph([gen(), prompt()], [edge("p", "g", "prompt")])
+    assert any("Game screen restyle needs an original image" in e for e in errors_of(no_original))
+    sheet = graph([gen(preset="assets"), prompt()], [edge("p", "g", "prompt")])
+    assert any("Asset sheet needs an original image" in e for e in errors_of(sheet))
 
 
 def test_manual_several_originals_requires_primary() -> None:
@@ -233,44 +261,89 @@ def test_server_rejects_cycles() -> None:
 # --- plan: prompt compilation ----------------------------------------------------------------------
 
 
-def test_prompt_order_and_sections() -> None:
-    g = graph(
-        [
-            gen(mode="match", artStyle="Soft 3D", background="solid", backgroundValue="pink"),
-            prompt("Style text", "ps", role="style"),
-            prompt("Repaint {asset_name} #{asset_index} v{variant_index}", "pm", constraints="No text"),
-            collection("c", "a1", overrides={"a1": "Make it blue"}),
-            node("t", "theme", assetId="t1", roles=["lighting", "artStyle"], notes="Glossy."),
-            node("pal", "palette", colors=[{"hex": "#ff0000", "role": "primary", "ratio": 60}]),
-        ],
-        [edge("ps", "g", "prompt"), edge("pm", "g", "prompt"), edge("c", "g", "original"), edge("t", "g", "theme"), edge("pal", "g", "palette")],
-    )
-    text = plan(g).tasks[0].prompt
-    order = [
-        "Repaint flower_01 #1 v1",
-        "Constraints: No text",
-        "Style text",
-        'Asset: flower_01 from the collection "c".',
-        "Original image: attached image 1",
-        "Theme references: attached image 2 is style references. Follow their art style and lighting. Glossy.",
-        "Color palette: use primary #FF0000 (about 60%).",
-        "Game asset type: Item. Art style: Soft 3D",
-        "For this asset: Make it blue",
-        "Output: aspect ratio 1:1, solid pink background.",
+
+def test_each_prompt_gets_the_full_set_of_outputs() -> None:
+    edges = [edge("p", "g", "prompt"), edge("p2", "g", "prompt"), edge("orig", "g", "original")]
+    p = plan(graph([gen(outputCount=3), prompt("Crochet."), prompt("Wood.", "p2"), orig()], edges))
+    assert [t.slot_index for t in p.tasks] == list(range(6))
+    assert [t.prompt_number for t in p.tasks] == [1, 1, 1, 2, 2, 2]
+    assert [t.variant_index for t in p.tasks] == [1, 2, 3, 1, 2, 3]
+    assert all(t.prompt_count == 2 for t in p.tasks)
+    assert all("Crochet." in t.prompt for t in p.tasks[:3]) and all("Wood." in t.prompt for t in p.tasks[3:])
+    m = plan(graph([gen(mode="match", variantsPerInput=2), prompt("A"), prompt("B", "p2"), collection("c", "a1", "a2")],
+                   [edge("p", "g", "prompt"), edge("p2", "g", "prompt"), edge("c", "g", "original")]))
+    assert len(m.tasks) == 2 * 2 * 2  # prompts x originals x variants
+    one = plan(graph([gen(outputCount=2), prompt("A"), prompt("B", "p2", enabled=False), orig()],
+                     [edge("p", "g", "prompt"), edge("p2", "g", "prompt"), edge("orig", "g", "original")]))
+    assert len(one.tasks) == 2 and one.tasks[0].prompt_count == 1  # a disabled prompt adds nothing
+
+
+def test_the_task_limit_counts_every_prompt() -> None:
+    edges = [edge("p", "g", "prompt"), edge("p2", "g", "prompt"), edge("orig", "g", "original")]
+    errs = errors_of(graph([gen(outputCount=150), prompt("A"), prompt("B", "p2"), orig()], edges))
+    assert any("300 tasks" in e for e in errs)
+
+
+def test_the_prompt_is_the_chosen_preset_with_the_request_and_the_extras() -> None:
+    nodes = [
+        gen(preset="screen"),
+        prompt("Make it crochet. Repaint {asset_name}."),
+        prompt("Keep colours bright.", "p2"),
+        node("o", "image", assetId="a1", notes="", roles=[]),
+        node("t", "image", assetId="t1", roles=["lighting", "artStyle"], notes="Glossy."),
+        node("pal", "palette", colors=[{"hex": "#ff0000", "role": "primary", "ratio": 60}]),
     ]
-    positions = [text.index(s) for s in order]
-    assert positions == sorted(positions), text
+    edges = [edge("p", "g", "prompt"), edge("p2", "g", "prompt"), edge("o", "g", "original"), edge("t", "g", "theme"), edge("pal", "g", "palette")]
+    both = plan(graph(nodes, edges))
+    text = both.tasks[0].prompt
+    assert text.startswith("You are a professional mobile game artist.")  # preset 1
+    assert "- User request: Make it crochet. Repaint flower_01.\n" in text  # placeholders filled
+    assert "Keep colours bright." not in text  # each Prompt node is its own request
+    assert "- User request: Keep colours bright.\n" in both.tasks[1].prompt
+    assert "{{" not in text  # no template marker is left behind
+    assert "Art direction notes" in text and "attached art" not in text.lower()
+    extras = text.split("ADDITIONAL INPUTS\n")[1]
+    assert extras.splitlines() == [
+        "- Attached image 1 is the original game screenshot.",
+        "- Style references: attached image 2 is style references. Follow their art style and lighting. Glossy. Do not copy their subjects.",
+        "- Color palette: use primary #FF0000 (about 60%).",
+        "- Requested output aspect ratio: 1:1. This overrides any aspect-ratio rule above.",
+    ]
+
+    nodes[0] = gen(preset="assets", assetSelection="pots, ice and number badges", aspectRatio="match")
+    sheet = plan(graph(nodes, edges)).tasks[0].prompt
+    assert sheet.startswith("You are a professional mobile game asset artist.")
+    assert "- Optional asset selection: pots, ice and number badges" in sheet
+    assert "Attached image 1 is the original game screenshot or asset reference image." in sheet
+    assert "aspect-ratio rule above" not in sheet  # "match" adds no aspect line
+
+    nodes[0] = gen(preset="assets")
+    assert "- Optional asset selection: none (identify the distinct reusable gameplay assets yourself)" in plan(graph(nodes, edges)).tasks[0].prompt
+
+
+def test_an_unknown_preset_is_refused_and_the_old_options_are_ignored() -> None:
+    base = [prompt(), orig()]
+    edges = [edge("p", "g", "prompt"), edge("orig", "g", "original")]
+    assert any("Choose a preset" in e for e in errors_of(graph([gen(preset="poster"), *base], edges)))
+    # Saved projects still carry the removed game-asset fields; they change nothing.
+    old = gen(assetCategory="Item", artStyle="Soft 3D", background="white", preserveSubject=True, consistentFraming=True)
+    assert plan(graph([old, *base], edges)).tasks[0].prompt == plan(graph([gen(), *base], edges)).tasks[0].prompt
+    legacy_prompt = prompt(constraints="No text", role="style", order=3, assetCategory="Item", artStyle="x")
+    assert plan(graph([gen(), legacy_prompt, orig()], edges)).tasks[0].prompt == plan(graph([gen(), *base], edges)).tasks[0].prompt
+
 
 
 def test_unknown_and_unfillable_placeholders_are_reported() -> None:
-    errs = errors_of(graph([gen(), prompt("Draw {thing}")], [edge("p", "g", "prompt")]))
+    edges = [edge("p", "g", "prompt"), edge("orig", "g", "original")]
+    errs = errors_of(graph([gen(), prompt("Draw {thing}"), orig()], edges))
     assert any("Unknown placeholder {thing}" in e for e in errs)
-    errs = errors_of(graph([gen(), prompt("Draw {asset_name}")], [edge("p", "g", "prompt")]))
-    assert any("{asset_name} cannot be filled" in e for e in errs)
+    errs = errors_of(graph([gen(), prompt("Draw {collection_name}"), orig()], edges))
+    assert any("{collection_name} cannot be filled" in e for e in errs)
+    assert "Draw flower_01" in plan(graph([gen(), prompt("Draw {asset_name}"), orig()], edges)).tasks[0].prompt
 
 
 def test_invalid_palette_hex() -> None:
-    g = graph([gen(), prompt(), node("pal", "palette", colors=[{"hex": "#12", "role": "primary"}])], [edge("p", "g", "prompt"), edge("pal", "g", "palette")])
+    g = graph([gen(), prompt(), orig(), node("pal", "palette", colors=[{"hex": "#12", "role": "primary"}])], [edge("p", "g", "prompt"), edge("orig", "g", "original"), edge("pal", "g", "palette")])
     assert any("not a valid HEX" in e for e in errors_of(g))
 
 
@@ -312,6 +385,12 @@ def wait(c: TestClient, batch_id: str, timeout: float = 5.0) -> dict[str, Any]:
     raise AssertionError(f"batch did not settle: {batch}")
 
 
+def solo_graph(c: TestClient, pid: str, **gen_data: Any) -> dict[str, Any]:
+    """One prompt, one uploaded original ("main.png"), one Generate node."""
+    (asset,) = import_assets(c, pid, "main.png")
+    return graph([gen(**gen_data), prompt(), orig("orig", asset)], [edge("p", "g", "prompt"), edge("orig", "g", "original")])
+
+
 def match_graph(ids: list[str], variants: int = 1) -> dict[str, Any]:
     return graph(
         [gen(mode="match", variantsPerInput=variants), prompt("Repaint {asset_name}"), collection("c", *ids)],
@@ -330,7 +409,7 @@ def test_batch_runs_and_stores_outputs(ctx) -> None:
     tasks = c.get(f"/api/generations/{batch['id']}/tasks").json()
     assert [t["source_asset_id"] for t in tasks] == ids
     assert all(t["status"] == "completed" and t["result"]["width"] == 32 for t in tasks)
-    assert tasks[0]["prompt"].startswith("Repaint flower_01")
+    assert "Repaint flower_01" in tasks[0]["prompt"] and tasks[0]["prompt"].startswith("You are a professional mobile game artist.")
     # Each call carried its own original image first.
     assert [op for op, _ in fake.calls] == ["edit", "edit"]
     assert fake.calls[0][1].original_image == png("red")
@@ -338,6 +417,140 @@ def test_batch_runs_and_stores_outputs(ctx) -> None:
     assets = {a["id"]: a for a in c.get(f"/api/projects/{pid}/assets").json()}
     out = assets[tasks[0]["output_asset_id"]]
     assert (out["name"], out["origin"]) == ("flower_01_v01.png", "generated")
+
+
+@pytest.mark.parametrize("concurrency", [1, 2, 4])
+def test_worker_stays_sequential_with_legacy_concurrency(ctx, concurrency) -> None:
+    c, pid, fake, _ = ctx
+    fake.gate = threading.Event()
+    batch_id = start(c, pid, solo_graph(c, pid, outputCount=5, concurrency=concurrency)).json()["batch"]["id"]
+    try:
+        deadline = time.monotonic() + 3
+        while len(fake.calls) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(fake.calls) == 1
+        time.sleep(0.05)
+        assert len(fake.calls) == 1
+    finally:
+        fake.gate.set()
+    batch = wait(c, batch_id)
+    assert batch["status"] == "completed" and batch["completed_count"] == 5
+    assert len(fake.calls) == 5
+
+
+@pytest.mark.parametrize("separate_projects", [False, True])
+def test_generate_nodes_run_concurrently_but_each_node_stays_sequential(ctx, separate_projects) -> None:
+    c, pid, fake, _ = ctx
+    other_pid = c.post("/api/projects", json={"name": "Other"}, headers=CSRF).json()["id"] if separate_projects else pid
+    first_graph = solo_graph(c, pid, outputCount=3)
+    second_graph = solo_graph(c, other_pid, outputCount=3)
+    second_id = "g" if separate_projects else "other-g"
+    for n in second_graph["nodes"]:
+        if n["id"] == "g":
+            n["id"] = second_id
+    for e in second_graph["edges"]:
+        if e["target"] == "g":
+            e["target"] = second_id
+    fake.gate = threading.Event()
+    try:
+        first = start(c, pid, first_graph)
+        assert first.status_code == 201, first.text
+        second = c.post("/api/generations", json={"project_id": other_pid,
+                        "generate_node_id": second_id, "graph": second_graph}, headers=CSRF)
+        assert second.status_code == 201, second.text
+        deadline = time.monotonic() + 3
+        while len(fake.calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(fake.calls) == 2
+        time.sleep(0.05)
+        assert len(fake.calls) == 2
+        for response in (first, second):
+            tasks = c.get(f"/api/generations/{response.json()['batch']['id']}/tasks").json()
+            assert sum(t["status"] in ("preparing", "running") for t in tasks) == 1
+    finally:
+        fake.gate.set()
+    for response in (first, second):
+        assert wait(c, response.json()["batch"]["id"])["completed_count"] == 3
+
+
+@pytest.mark.parametrize("fmt,mime", [("png", "image/png"), ("webp", "image/webp"), ("jpg", "image/jpeg")])
+def test_generation_stores_requested_format(ctx, fmt, mime) -> None:
+    c, pid, _, _ = ctx
+    batch_id = start(c, pid, solo_graph(c, pid, outputFormat=fmt)).json()["batch"]["id"]
+    assert wait(c, batch_id)["status"] == "completed"
+    task = c.get(f"/api/generations/{batch_id}/tasks").json()[0]
+    assert task["result"]["mime_type"] == mime
+    assert task["result"]["provider_mime_type"] == "image/png"
+    response = c.get(f"/api/assets/{task['output_asset_id']}/file")
+    assert response.headers["content-type"] == mime
+
+
+def test_edit_generated_result_sends_its_pixels_not_the_first_original(ctx) -> None:
+    c, pid, fake, _ = ctx
+    first = start(c, pid, solo_graph(c, pid)).json()["batch"]["id"]
+    wait(c, first)
+    old = c.get(f"/api/generations/{first}/tasks").json()[0]["output_asset_id"]
+    edit_graph = graph([gen(editResult=True), prompt("Make only the flowers pink."), node("result", "output", assetId=old),
+                        node("edited", "output", assetId=None, sourceNodeId="result")],
+                       [edge("p", "g", "prompt"), edge("result", "g", "original"), edge("result", "edited", "edit")])
+    response = start(c, pid, edit_graph)
+    assert response.status_code == 201, response.text
+    edited = wait(c, response.json()["batch"]["id"])
+    assert edited["status"] == "completed"
+    assert fake.calls[-1][1].original_image == png()
+    assert fake.calls[-1][1].original_image != png("red")
+    assert "Make only the flowers pink." in fake.calls[-1][1].prompt
+    assert "PRESERVE GAMEPLAY AND LAYOUT" not in fake.calls[-1][1].prompt
+    assert c.get(f"/api/assets/{old}/file").status_code == 200
+
+
+def test_origin_prompt_follows_edits_back_to_the_request_that_made_the_image(ctx) -> None:
+    c, pid, _, _ = ctx
+    first = start(c, pid, solo_graph(c, pid)).json()["batch"]["id"]
+    wait(c, first)
+    old = c.get(f"/api/generations/{first}/tasks").json()[0]["output_asset_id"]
+    assert c.get(f"/api/assets/{old}/origin-prompt").json() == {"prompts": ["Change it to a crochet style."]}
+    edit_graph = graph([gen(editResult=True), prompt("Make only the flowers pink."), node("result", "output", assetId=old),
+                        node("edited", "output", assetId=None, sourceNodeId="result")],
+                       [edge("p", "g", "prompt"), edge("result", "g", "original"), edge("result", "edited", "edit")])
+    second = start(c, pid, edit_graph).json()["batch"]["id"]
+    wait(c, second)
+    new = c.get(f"/api/generations/{second}/tasks").json()[0]["output_asset_id"]
+    assert c.get(f"/api/assets/{new}/origin-prompt").json()["prompts"] == ["Change it to a crochet style.", "Make only the flowers pink."]
+    upload = c.post("/api/assets/import", data={"project_id": pid}, files=[("files", ("u.png", png(), "image/png"))], headers=CSRF)
+    assert c.get(f"/api/assets/{upload.json()['imported'][0]['id']}/origin-prompt").json() == {"prompts": []}
+
+
+def test_regenerate_chosen_success_preserves_old_attempt_and_deduplicates_ids(ctx) -> None:
+    c, pid, fake, _ = ctx
+    batch_id = start(c, pid, solo_graph(c, pid)).json()["batch"]["id"]
+    wait(c, batch_id)
+    original = c.get(f"/api/generations/{batch_id}/tasks").json()[0]
+    response = c.post(f"/api/generations/{batch_id}/retry", json={"task_ids": [original["id"], original["id"]]}, headers=CSRF)
+    assert response.status_code == 200 and response.json()["retried"] == 1
+    assert wait(c, batch_id)["completed_count"] == 1
+    tasks = c.get(f"/api/generations/{batch_id}/tasks").json()
+    assert len(tasks) == 2 and len(fake.calls) == 2
+    assert tasks[0]["output_asset_id"] == original["output_asset_id"]
+    assert tasks[1]["output_asset_id"] != original["output_asset_id"]
+    assert fake.calls[0][1].prompt == fake.calls[1][1].prompt
+
+
+@pytest.mark.parametrize("edited", ["Change only the flowers to pink.", "", "   "])
+def test_retry_can_edit_prompt_and_keeps_original_inputs_and_settings(ctx, edited) -> None:
+    c, pid, fake, _ = ctx
+    batch_id = start(c, pid, solo_graph(c, pid)).json()["batch"]["id"]
+    wait(c, batch_id)
+    original = c.get(f"/api/generations/{batch_id}/tasks").json()[0]
+    response = c.post(f"/api/generations/{batch_id}/retry", json={"task_ids": [original["id"]], "prompt": edited}, headers=CSRF)
+    assert response.status_code == 200
+    assert wait(c, batch_id)["status"] == "completed"
+    tasks = c.get(f"/api/generations/{batch_id}/tasks").json()
+    assert tasks[0]["prompt"] == original["prompt"]
+    assert tasks[1]["prompt"] == (edited.strip() or original["prompt"])
+    assert tasks[1]["request"] == original["request"]
+    assert fake.calls[1][1].original_image == fake.calls[0][1].original_image == png("red")
+    assert fake.calls[1][1].settings == fake.calls[0][1].settings
 
 
 def test_failures_keep_successes_and_retry_failed_only(ctx) -> None:
@@ -393,7 +606,7 @@ def test_cancel_keeps_completed_outputs(ctx) -> None:
 def test_requires_connected_provider_and_valid_graph(ctx) -> None:
     c, pid, fake, _ = ctx
     fake.auth_state = "not_connected"
-    res = start(c, pid, graph([gen(), prompt()], [edge("p", "g", "prompt")]))
+    res = start(c, pid, solo_graph(c, pid))
     assert res.status_code == 409 and res.json()["error"]["code"] == "AUTH_REQUIRED"
     fake.auth_state = "connected"
     res = start(c, pid, graph([gen(mode="match"), prompt()], [edge("p", "g", "prompt")]))
@@ -408,19 +621,19 @@ def test_preview_lists_compiled_prompts(ctx) -> None:
     res = c.post("/api/generations/preview", json=body, headers=CSRF).json()
     assert res["ok"] and res["total_tasks"] == 4
     assert res["provider"]["auth_state"] == "connected"
-    assert res["tasks"][2]["prompt"].startswith("Repaint flower_02")
+    assert "Repaint flower_02" in res["tasks"][2]["prompt"]
     body["graph"] = graph([gen(), prompt("{nope}")], [edge("p", "g", "prompt")])
     res = c.post("/api/generations/preview", json=body, headers=CSRF).json()
     assert not res["ok"] and "Unknown placeholder" in res["errors"][0]
 
 
-def test_text_only_name_and_list(ctx) -> None:
+def test_output_names_and_history_list(ctx) -> None:
     c, pid, fake, _ = ctx
-    batch = wait(c, start(c, pid, graph([gen(outputCount=2), prompt()], [edge("p", "g", "prompt")])).json()["batch"]["id"])
+    batch = wait(c, start(c, pid, solo_graph(c, pid, outputCount=2)).json()["batch"]["id"])
     assert batch["status"] == "completed"
-    assert [op for op, _ in fake.calls] == ["generate", "generate"]
-    names = sorted(a["name"] for a in c.get(f"/api/projects/{pid}/assets").json())
-    assert names == ["g_01.png", "g_02.png"]
+    assert [op for op, _ in fake.calls] == ["edit", "edit"]  # both presets always work from the original
+    names = sorted(a["name"] for a in c.get(f"/api/projects/{pid}/assets").json() if a["origin"] == "generated")
+    assert names == ["main_v01.png", "main_v02.png"]
     assert [b["id"] for b in c.get(f"/api/generations?project_id={pid}").json()] == [batch["id"]]
 
 
@@ -451,7 +664,7 @@ def test_restart_marks_running_tasks_interrupted(ctx) -> None:
 def test_client_chosen_batch_id(ctx) -> None:
     c, pid, _, _ = ctx
     bid = "6f1c2c4e-8a3b-4d7e-9f00-123456789abc"
-    body = {"project_id": pid, "generate_node_id": "g", "graph": graph([gen(), prompt()], [edge("p", "g", "prompt")]), "batch_id": bid}
+    body = {"project_id": pid, "generate_node_id": "g", "graph": solo_graph(c, pid), "batch_id": bid}
     res = c.post("/api/generations", json=body, headers=CSRF)
     assert res.status_code == 201 and res.json()["batch"]["id"] == bid
     wait(c, bid)
@@ -473,28 +686,10 @@ def test_one_image_node_takes_its_role_from_the_port() -> None:
     assert plan(g).tasks[0].original_asset_id == "a3"
 
 
-def test_game_screen_keeps_gameplay_and_matches_aspect() -> None:
-    assets = {**ASSETS, "shot": AssetMeta("level36.png", False, 1080, 1920)}
-    g = graph(
-        [gen(assetCategory="Game Screen", aspectRatio="match", background="white"), prompt("Winter theme"), node("o", "image", assetId="shot")],
-        [edge("p", "g", "prompt"), edge("o", "g", "original")],
-    )
-    task = plan(g, assets=assets).tasks[0]
-    assert task.aspect_ratio == "9:16"
-    assert "keep the gameplay identical" in task.prompt
-    assert "composition" in task.prompt and "object count" in task.prompt
-    assert "Single centered subject" not in task.prompt
-    assert "white background" not in task.prompt
-    assert "Output: aspect ratio 9:16, the screen's own full-bleed background" in task.prompt
-
-    text_only = graph([gen(aspectRatio="match"), prompt()], [edge("p", "g", "prompt")])
-    assert any("Match original" in e for e in errors_of(text_only))
-
-
 def test_project_delete_refused_while_batch_runs(ctx) -> None:
     c, pid, fake, _ = ctx
     fake.gate = threading.Event()
-    batch_id = start(c, pid, graph([gen(), prompt()], [edge("p", "g", "prompt")])).json()["batch"]["id"]
+    batch_id = start(c, pid, solo_graph(c, pid)).json()["batch"]["id"]
     assert fake.started.wait(2)
     res = c.delete(f"/api/projects/{pid}", headers=CSRF)
     assert res.status_code == 409 and res.json()["error"]["code"] == "BATCH_ACTIVE"
@@ -503,21 +698,11 @@ def test_project_delete_refused_while_batch_runs(ctx) -> None:
     assert c.delete(f"/api/projects/{pid}", headers=CSRF).status_code == 204
 
 
-def test_game_asset_settings_come_from_the_prompt() -> None:
-    g = graph(
-        [gen(assetCategory="Item", artStyle="old"), prompt(assetCategory="Character", artStyle="Chibi", consistentFraming=False)],
-        [edge("p", "g", "prompt")],
-    )
-    text = plan(g).tasks[0].prompt
-    assert "Game asset type: Character. Art style: Chibi" in text
-    assert "Single centered subject" not in text
-
-
 def test_palette_image_port_is_valid_and_single() -> None:
     img = lambda i: node(i, "image", assetId="a1", notes="", preserve={}, instructions="", roles=[])  # noqa: E731
     pal = node("pal", "palette", colors=[{"hex": "#112233", "role": "primary", "ratio": 60}])
-    base = [gen(), prompt(), img("i1"), img("i2"), pal]
-    edges = [edge("p", "g", "prompt"), edge("pal", "g", "palette"), edge("i1", "pal", "image")]
+    base = [gen(), prompt(), orig(), img("i1"), img("i2"), pal]
+    edges = [edge("p", "g", "prompt"), edge("orig", "g", "original"), edge("pal", "g", "palette"), edge("i1", "pal", "image")]
     assert plan(graph(base, edges)).tasks  # an image feeding a palette is fine
     errs = errors_of(graph(base, [*edges, edge("i2", "pal", "image")]))
     assert any("accepts only one connection" in e for e in errs)
@@ -530,7 +715,7 @@ def test_manual_count_sends_every_original_with_the_primary_first() -> None:
     task = plan(graph(nodes, edges)).tasks[0]
     assert task.original_asset_id == "a2"  # the primary
     assert task.extra_original_asset_ids == ["a1", "a3"]  # the rest, in connection order, collection items included
-    assert "Additional originals: attached images 2–3 are also provided as original assets" in task.prompt
+    assert "- Additional originals: attached images 2–3 are also provided as originals (secondary)" in task.prompt
 
     # Match inputs: one original per task, so nothing extra.
     nodes[0] = gen(mode="match")
@@ -552,42 +737,37 @@ def test_extra_originals_reach_the_provider_in_prompt_order(ctx) -> None:
     assert len(request.reference_images) == 1  # the extra original follows the primary
 
 
-def test_game_screen_without_an_original_is_refused() -> None:
-    g = graph([gen(), prompt(assetCategory="Game Screen")], [edge("p", "g", "prompt")])
-    assert any("Game Screen needs an original image" in e for e in errors_of(g))
+
+def test_match_original_aspect_resolves_to_the_closest_preset_per_original() -> None:
+    assets = {**ASSETS, "shot": AssetMeta("level36.png", False, 1080, 1920)}
+    g = graph([gen(aspectRatio="match"), prompt(), orig("o", "shot")], [edge("p", "g", "prompt"), edge("o", "g", "original")])
+    task = plan(g, assets=assets).tasks[0]
+    assert task.aspect_ratio == "9:16"
+    assert "aspect-ratio rule above" not in task.prompt  # the preset already says "same aspect ratio as the input"
 
 
-def test_extract_node_fills_an_input_collection_and_cannot_feed_generate_directly() -> None:
-    src = node("src", "image", assetId="t1", notes="", preserve={}, instructions="", roles=[])
-    col = collection("c", "a1", "a2", "a3", disabled=("a2",), overrides={"a1": "the left one"})
-    chain = graph([gen(mode="match"), prompt("Redraw {asset_name}"), src, node("x", "extract", hint="", detections=None, off=[]), col],
-                  [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("x", "c", "extract"), edge("c", "g", "original")])
-    p = plan(chain)
-    assert [(t.original_asset_id, t.source.name) for t in p.tasks] == [("a1", "flower_01"), ("a3", "flower_03")]
-    assert "For this asset: the left one" in p.tasks[0].prompt
 
-    # Straight into Generate is not a valid connection: the cut-outs live in the collection.
-    direct = graph([gen(), prompt(), src, node("x", "extract", hint="", detections=None, off=[])],
-                   [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("x", "g", "original")])
-    assert any("cannot connect to the original port" in e for e in errors_of(direct))
-    # Only an Input Collection takes extracted assets; the Extract node takes exactly one image.
-    out_col = node("c", "collection", role="output", description="", items=[])
-    wrong = graph([gen(), prompt(), src, node("x", "extract"), out_col], [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("x", "c", "extract")])
-    assert any("Extracted assets can only go to an Input Collection" in e for e in errors_of(wrong))
-    two = graph([gen(), prompt(), src, node("src2", "image", assetId="a1", notes="", preserve={}, instructions="", roles=[]), node("x", "extract")],
-                [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("src2", "x", "image")])
+def test_extract_node_only_outputs_to_an_input_collection() -> None:
+    src = node("src", "image", assetId="t1", notes="", roles=[])
+    ex = node("x", "extract", hint="", detections=None, off=[], generateNodeId=None)
+    ok = graph([gen(), prompt(), orig(), src, ex], [edge("p", "g", "prompt"), edge("orig", "g", "original"), edge("src", "x", "image")])
+    assert plan(ok).tasks  # it does not take part in the generation
+
+    # It has nothing to give to a Generate node.
+    wired = graph([gen(), prompt(), orig(), src, ex], [edge("p", "g", "prompt"), edge("src", "x", "image"), edge("x", "g", "original")])
+    assert any("cannot connect" in e for e in errors_of(wired))
+    two = graph([gen(), prompt(), orig(), src, node("src2", "image", assetId="a1", notes="", roles=[]), ex],
+                [edge("p", "g", "prompt"), edge("orig", "g", "original"), edge("src", "x", "image"), edge("src2", "x", "image")])
     assert any("accepts only one connection" in e for e in errors_of(two))
 
-
-def test_a_collection_item_label_names_the_task_so_one_image_can_be_redrawn_per_asset() -> None:
-    items = [
-        {"id": "i0", "assetId": "a1", "enabled": True, "label": "blue pot", "promptOverride": "the pot at the top left"},
-        {"id": "i1", "assetId": "a1", "enabled": True, "label": "pause button", "promptOverride": "the round button"},
-        {"id": "i2", "assetId": "a1", "enabled": True, "promptOverride": ""},  # no label: the image name
-    ]
-    col = node("c", "collection", role="input", description="", items=items)
-    p = plan(graph([gen(mode="match"), prompt("Redraw the {asset_name}"), col], [edge("p", "g", "prompt"), edge("c", "g", "original")]))
-    assert [t.source.name for t in p.tasks] == ["blue pot", "pause button", "flower_01"]
-    assert p.tasks[0].prompt.startswith("Redraw the blue pot")
-    assert "For this asset: the pot at the top left" in p.tasks[0].prompt
-    assert all(t.original_asset_id == "a1" for t in p.tasks)  # always the full original image
+    crops = node('c', 'collection', role='input', items=[
+        {'assetId': 'a1', 'enabled': True, 'promptOverride': ''},
+        {'assetId': 't1', 'enabled': True, 'promptOverride': ''},
+    ])
+    workflow = graph([gen(mode='match', preset='assets', variantsPerInput=1), prompt(text='Remove background.'), src, ex, crops],
+                     [edge('src', 'x', 'image'), edge('x', 'c', 'extract'), edge('c', 'g', 'original'), edge('p', 'g', 'prompt')])
+    tasks = plan(workflow).tasks
+    assert len(tasks) == 2
+    assert [t.original_asset_id for t in tasks] == ['a1', 't1']
+    crops['data']['role'] = 'output'
+    assert any('input collection' in e for e in errors_of(workflow))

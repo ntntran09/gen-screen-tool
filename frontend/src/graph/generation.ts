@@ -1,11 +1,20 @@
 import { collectionItems } from './collections';
-import { GAME_SCREEN, type CanvasEdge, type CanvasNode, type CollectionData, type CollectionItem, type GenerateData, type OutputData } from './types';
+import type { CanvasEdge, CanvasNode, CollectionData, CollectionItem, GenerateData, OutputData, PromptData } from './types';
+
+/** Match the receiver's saved action, rather than treating every inline run as Retry. */
+export function resultActionFor(nodes: CanvasNode[], sourceId: string, batchId: string): OutputData['resultAction'] | null {
+  const result = nodes.find((n) => n.type === 'output' && n.data.sourceNodeId === sourceId && n.data.generationId === batchId);
+  if (!result) return null;
+  const data = result.data as OutputData;
+  return data.resultAction ?? (data.pendingSlot !== undefined ? 'retry' : data.title === 'Varied result' ? 'variation' : null);
+}
 
 /** The subset of a backend task needed to place its result on the canvas. */
 export interface TaskResult {
   id: string;
   batch_id: string;
   slot_index: number;
+  attempt_number?: number;
   status: string;
   output_asset_id: string | null;
 }
@@ -18,7 +27,15 @@ export function estimateTasks(nodes: CanvasNode[], edges: CanvasEdge[], generate
   const gen = nodes.find((n) => n.id === generateId);
   if (gen?.type !== 'generate') return 0;
   const data = gen.data as GenerateData;
-  if (data.mode === 'manual') return data.outputCount;
+  // Each enabled Prompt node with text gets its own full set of results.
+  let prompts = 0;
+  for (const e of edges) {
+    if (e.target !== generateId || e.targetHandle !== 'prompt') continue;
+    const src = nodes.find((n) => n.id === e.source);
+    if (src?.type === 'prompt' && (src.data as PromptData).enabled !== false && (src.data as PromptData).text.trim()) prompts += 1;
+  }
+  prompts = Math.max(1, prompts);
+  if (data.mode === 'manual') return data.outputCount * prompts;
   let originals = 0;
   for (const e of edges) {
     if (e.target !== generateId || e.targetHandle !== 'original') continue;
@@ -26,7 +43,7 @@ export function estimateTasks(nodes: CanvasNode[], edges: CanvasEdge[], generate
     if (src?.type === 'image' || src?.type === 'output') originals += 1;
     else if (src?.type === 'collection') originals += collectionItems(src).filter((i) => i.enabled).length;
   }
-  return originals * data.variantsPerInput;
+  return originals * data.variantsPerInput * prompts;
 }
 
 export type OriginalRole =
@@ -62,33 +79,6 @@ export function originalEdgeRoles(nodes: CanvasNode[], edges: CanvasEdge[], gene
   return roles;
 }
 
-/**
- * Does this Generate node need an original image to run? Match inputs makes one result per
- * original; "Match original" aspect needs an image to measure; a Game Screen is the screen to re-theme.
- * Mirrors the backend rules (`backend/app/generation/plan.py`).
- */
-export function generateNeedsOriginal(nodes: CanvasNode[], edges: CanvasEdge[], generateId: string): boolean {
-  const gen = nodes.find((n) => n.id === generateId);
-  if (gen?.type !== 'generate') return false;
-  const data = gen.data as GenerateData;
-  if (data.mode === 'match' || data.aspectRatio === 'match') return true;
-  return edges.some((e) => {
-    if (e.target !== generateId || e.targetHandle !== 'prompt') return false;
-    const prompt = nodes.find((n) => n.id === e.source);
-    return prompt?.type === 'prompt' && (prompt.data as { assetCategory?: string }).assetCategory === GAME_SCREEN;
-  });
-}
-
-/** The Input Collection an Extract Assets node fills, if one is connected to its Assets port. */
-export function extractedCollection(nodes: CanvasNode[], edges: CanvasEdge[], extractId: string): CanvasNode | null {
-  for (const e of edges) {
-    if (e.source !== extractId || e.targetHandle !== 'extract') continue;
-    const target = nodes.find((n) => n.id === e.target);
-    if (target?.type === 'collection') return target;
-  }
-  return null;
-}
-
 /** An Output Collection already fed by this Generate node, reused for new batches. */
 export function connectedOutputCollection(nodes: CanvasNode[], edges: CanvasEdge[], generateId: string): CanvasNode | null {
   for (const e of edges) {
@@ -114,7 +104,9 @@ export function attachResults(nodes: CanvasNode[], tasks: TaskResult[]): CanvasN
     if (node.type === 'output') {
       const data = node.data as OutputData;
       if (data.assetId || !data.generationId) return node;
-      const task = done.find((t) => t.batch_id === data.generationId);
+      const task = done.find((t) => t.batch_id === data.generationId &&
+        (data.pendingSlot === undefined || t.slot_index === data.pendingSlot) &&
+        (data.pendingAttempt === undefined || t.attempt_number === data.pendingAttempt));
       if (!task) return node;
       changed = true;
       return { ...node, data: { ...data, assetId: task.output_asset_id, taskId: task.id } };
@@ -151,6 +143,7 @@ export function attachResults(nodes: CanvasNode[], tasks: TaskResult[]): CanvasN
 export function referencedBatchIds(nodes: CanvasNode[]): Set<string> {
   const ids = new Set<string>();
   for (const n of nodes) {
+    for (const id of n.data.inlineGeneration?.batchIds ?? []) ids.add(id);
     if (n.type === 'output' && (n.data as OutputData).generationId) ids.add((n.data as OutputData).generationId!);
     if (n.type === 'collection') for (const id of (n.data as CollectionData).batchIds ?? []) ids.add(id);
   }

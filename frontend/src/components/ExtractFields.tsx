@@ -1,21 +1,22 @@
+import { useState } from 'react';
 import { currentDetections, sourceAssetFor } from '../graph/detect';
-import { extractedCollection } from '../graph/generation';
 import type { ExtractData } from '../graph/types';
 import { assetUrls } from '../lib/api';
 import { useAssetStore } from '../store/assetStore';
 import { useExtractStore } from '../store/extractStore';
 import { useGraphStore } from '../store/graphStore';
 import { Button, Section, TextInput } from './fields';
+import { CropEditor } from './CropEditor';
 
-/** Inspector for an Extract Assets node: find the assets, review them, then build the redraw nodes. */
+/** Inspector for an Extract Assets node: find the assets, review them, then crop them and build background removal. */
 export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: ExtractData; update: (p: Partial<ExtractData>) => void }) {
   const assetId = useGraphStore((s) => sourceAssetFor(s.nodes, s.edges, nodeId));
   const busy = useExtractStore((s) => s.busy[nodeId]);
   const error = useExtractStore((s) => s.error[nodeId]);
   const imageName = useAssetStore((s) => (assetId ? s.assets[assetId]?.name : undefined));
-  const collection = useGraphStore((s) => extractedCollection(s.nodes, s.edges, nodeId));
   const { detect } = useExtractStore.getState();
   const found = currentDetections(data, assetId);
+  const [editing, setEditing] = useState<{ index: number; found: NonNullable<ExtractData['detections']> } | null>(null);
   const items = found?.items ?? [];
   const off = new Set(data.off);
   const chosen = items.filter((_, i) => !off.has(i)).length;
@@ -30,35 +31,35 @@ export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: 
   const rename = (i: number, name: string) =>
     found && update({ detections: { ...found, items: found.items.map((it, k) => (k === i ? { ...it, name } : it)) } });
 
-  const redraw = () => {
-    const g = useGraphStore.getState();
-    const r = g.addExtractionWorkflow(nodeId);
-    if (!r) return;
-    g.showToast(
-      r.generate
-        ? `Built the redraw nodes for ${r.count} asset${r.count === 1 ? '' : 's'}. Press Generate to start.`
-        : `Updated the list to ${r.count} asset${r.count === 1 ? '' : 's'}.`,
-    );
-  };
-
   return (
     <>
       <Section
-        title="Find assets with AI"
-        note="A small ChatGPT model (gpt-6-luna) counts and names the separate assets in the connected image and marks where they are. It uses a little of your ChatGPT usage."
+        title="Find assets"
+        note="A small ChatGPT model finds the separate visual assets in your image, including objects, characters and UI elements. Thinking is kept light. It uses a little of your ChatGPT usage."
       >
         {assetId ? (
           <p className="text-[12px] text-ink-2">
             Image: <span className="font-medium text-ink">{imageName ?? 'connected image'}</span>
           </p>
         ) : (
-          <p className="text-[12px] text-warning">Connect an Image node (with a picture) to this node's Image port.</p>
+          <p className="text-[12px] text-warning">Image required.</p>
         )}
-        <TextInput label="Hint (optional)" value={data.hint} onChange={(hint) => update({ hint })} placeholder="e.g. only the flower pots and the buttons" />
+        <TextInput
+          label="Model"
+          value={data.model ?? ''}
+          onChange={(model) => update({ model: model.trim() })}
+          placeholder="Default (gpt-6-luna, then gpt-5.6-luna)"
+          list="extract-models"
+        />
+        <datalist id="extract-models">
+          <option value="gpt-6-luna" />
+          <option value="gpt-5.6-luna" />
+        </datalist>
+        <TextInput label="Find" value={data.hint} onChange={(hint) => update({ hint })} placeholder="e.g. flowers and pots only; no HUD" />
         <Button variant="primary" disabled={!assetId || busy !== undefined} onClick={() => void detect(nodeId)}>
           {busy === 'detect' ? 'Looking…' : found ? 'Find again' : 'Find assets'}
         </Button>
-        {stale && <p className="text-[12px] text-warning">The image changed since the last search. Find assets again.</p>}
+        {stale && <p className="text-[12px] text-warning">Image changed. Search again.</p>}
         {error && (
           <p role="alert" className="text-[12px] text-danger">
             {error}
@@ -67,17 +68,10 @@ export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: 
       </Section>
 
       {found && items.length > 0 && (
-        <Section
-          title="Redraw"
-          note="Builds a list of the original image once per ticked asset (each says which asset to take and where it is), plus a Prompt and a Generate that redraw each one as a clean standalone asset on a transparent background."
-        >
-          <Button variant="primary" disabled={chosen === 0} onClick={redraw}>
-            {collection ? `Update redraw list (${chosen})` : `Redraw nodes (${chosen})`}
+        <Section title="Asset sheet">
+          <Button variant="primary" disabled={chosen === 0 || busy !== undefined} onClick={() => void useExtractStore.getState().build(nodeId)}>
+            {busy === 'crop' ? 'Cutting assets…' : `Build asset sheet (${chosen})`}
           </Button>
-          {collection && (
-            <Button onClick={() => useAssetStore.getState().openViewer(collection.id)}>Open the list</Button>
-          )}
-          <p className="text-[11px] text-ink-3">Nothing is generated until you press Generate on the new node.</p>
         </Section>
       )}
       {found && items.length > 0 && (
@@ -124,14 +118,20 @@ export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: 
                   onChange={(e) => rename(i, e.target.value)}
                   className="min-w-0 flex-1 rounded-md border border-line bg-panel-2 px-1.5 py-1 text-[12px] outline-none focus:border-focus"
                 />
+                <button type="button" disabled={busy !== undefined} onClick={() => setEditing({ index: i, found })}
+                  aria-label={`Adjust crop of ${it.name}`} className="rounded-md border border-line px-1.5 py-1 text-[11px] hover:bg-accent-soft disabled:opacity-40">Crop</button>
               </li>
             ))}
           </ul>
-          <p className="text-[11px] text-ink-3">
-            The boxes are the model's best guess and only show where each asset is. Untick any that look wrong and fix the names;
-            the names are used in the prompt and for the result files.
-          </p>
+
         </Section>
+      )}
+      {editing && found === editing.found && found.items[editing.index] && busy === undefined && !data.locked && (
+        <CropEditor assetId={found.assetId} item={found.items[editing.index]} onClose={() => setEditing(null)}
+          onSave={(box) => {
+            update({ detections: { ...found, items: found.items.map((it, i) => i === editing.index ? { ...it, ...box } : it) } });
+            setEditing(null);
+          }} />
       )}
 
     </>

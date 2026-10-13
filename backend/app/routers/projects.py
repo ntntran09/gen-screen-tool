@@ -8,9 +8,10 @@ import sqlite3
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 
 from ..config import Settings
+from ..collaboration import frozen_nodes, validate_frozen_graph
 from ..db import now_iso, transaction
 from ..deps import get_conn, get_settings
 from ..errors import ApiError
@@ -39,6 +40,7 @@ def _summary(row: sqlite3.Row) -> ProjectSummary:
         description=row["description"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        graph_revision=row["graph_revision"],
     )
 
 
@@ -151,32 +153,52 @@ def get_project(project_id: str, conn: Conn) -> ProjectDetail:
 
 
 @router.put("/{project_id}", response_model=ProjectSummary)
-def update_project(project_id: str, body: ProjectUpdate, conn: Conn) -> ProjectSummary:
+async def update_project(project_id: str, body: ProjectUpdate, conn: Conn, request: Request) -> ProjectSummary:
     if body.graph is not None:
         _validate_graph(body.graph)
     ts = now_iso()
-    with transaction(conn):
-        _get_row(conn, project_id)
-        if body.name is not None:
-            conn.execute("UPDATE projects SET name = ? WHERE id = ?", (body.name, project_id))
-        if body.description is not None:
-            conn.execute("UPDATE projects SET description = ? WHERE id = ?", (body.description, project_id))
+    rooms = request.app.state.rooms
+    async with rooms.locks[project_id]:
+        with transaction(conn):
+            row = _get_row(conn, project_id)
+            if body.graph is not None:
+                if body.graph_revision != row["graph_revision"]:
+                    raise ApiError(409, "GRAPH_CONFLICT", "This project has newer edits. Reload before replacing its canvas.")
+                before = _load_graph(conn, row)
+                validate_frozen_graph(before, body.graph, frozen_nodes(conn, project_id, before))
+                _save_graph(conn, project_id, body.graph, ts)
+                conn.execute("UPDATE projects SET graph_revision = graph_revision + 1 WHERE id = ?", (project_id,))
+            if body.name is not None:
+                conn.execute("UPDATE projects SET name = ? WHERE id = ?", (body.name, project_id))
+            if body.description is not None:
+                conn.execute("UPDATE projects SET description = ? WHERE id = ?", (body.description, project_id))
+            conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (ts, project_id))
+        current = _get_row(conn, project_id)
         if body.graph is not None:
-            _save_graph(conn, project_id, body.graph, ts)
-        conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (ts, project_id))
+            rooms.documents[project_id] = body.graph
+            rooms.publish(project_id, {"type": "snapshot", "graph": body.graph.model_dump(),
+                                       "revision": current["graph_revision"], "name": current["name"]})
+        elif body.name is not None:
+            rooms.publish(project_id, {"type": "name", "name": body.name})
     return _summary(_get_row(conn, project_id))
 
 
 @router.delete("/{project_id}", status_code=204)
-def delete_project(project_id: str, conn: Conn, settings: Cfg) -> Response:
-    busy = conn.execute(
-        "SELECT 1 FROM generation_batches WHERE project_id = ? AND status IN ('queued', 'running')", (project_id,)
-    ).fetchone()
-    if busy:
-        raise ApiError(409, "BATCH_ACTIVE", "A generation is running in this project. Cancel it before deleting.")
-    with transaction(conn):
-        _get_row(conn, project_id)
-        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+async def delete_project(project_id: str, conn: Conn, settings: Cfg, request: Request) -> Response:
+    rooms = request.app.state.rooms
+    async with rooms.locks[project_id]:
+        busy = conn.execute(
+            "SELECT 1 FROM generation_batches WHERE project_id = ? AND (status IN ('queued', 'running')"
+            " OR EXISTS (SELECT 1 FROM generation_tasks t WHERE t.batch_id = generation_batches.id"
+            " AND t.status IN ('preparing', 'running', 'cancel_requested')))", (project_id,)
+        ).fetchone()
+        if busy:
+            raise ApiError(409, "BATCH_ACTIVE", "A generation is running in this project. Cancel it before deleting.")
+        with transaction(conn):
+            _get_row(conn, project_id)
+            conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        rooms.documents.pop(project_id, None)
+        rooms.publish(project_id, {"type": "deleted"})
     # Files are moved aside rather than erased so a mistaken delete stays recoverable.
     # project_id is a DB-validated UUID, so this path cannot escape the workspace.
     safe_id = str(uuid.UUID(project_id))

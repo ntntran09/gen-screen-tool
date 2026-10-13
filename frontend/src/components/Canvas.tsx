@@ -25,7 +25,7 @@ import {
 import { originalEdgeRoles, type OriginalRole } from '../graph/generation';
 import { mainClusterBounds } from '../graph/mainCluster';
 import { getDefinition, isNodeKind } from '../graph/registry';
-import type { CanvasEdge, CanvasNode, CollectionData, NodeKind } from '../graph/types';
+import type { CanvasEdge, CanvasNode, CollectionData, NodeKind, NodeDataByKind } from '../graph/types';
 import { checkConnection } from '../graph/validation';
 import { nodeTypes } from '../nodes/nodeTypes';
 import { isNodeFrozen, isNodeLocked, useGraphStore, type CanvasTool } from '../store/graphStore';
@@ -34,6 +34,7 @@ import { isTypingTarget } from '../hooks/useShortcuts';
 import { useAssetStore } from '../store/assetStore';
 import { AddNodeMenu } from './AddNodeMenu';
 import { ContextMenu, type MenuItem } from './ContextMenu';
+import { AnnotationLayer } from './AnnotationLayer';
 
 const ICON = {
   width: 16,
@@ -80,6 +81,8 @@ const TOOLS: { id: CanvasTool; label: string; key: string; icon: ReactNode }[] =
       </svg>
     ),
   },
+  { id: 'text', label: 'Text', key: 'T', icon: <svg {...ICON} className="tool-icon" aria-hidden><path d="M4 5h16M12 5v15M8 20h8" /></svg> },
+  { id: 'draw', label: 'Draw', key: 'P', icon: <svg {...ICON} className="tool-icon" aria-hidden><path d="m4 16-1 5 5-1L21 7l-4-4L4 16ZM14 6l4 4" /></svg> },
 ];
 
 type ItemMenu = { x: number; y: number; title: string; items: MenuItem[] };
@@ -147,7 +150,23 @@ export function Canvas() {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [itemMenu, setItemMenu] = useState<ItemMenu | null>(null);
   const tool = useGraphStore((s) => s.tool);
+  // React Flow's per-node flags override its global switches. Disable them explicitly
+  // for erasing/annotation tools, without persisting these temporary UI flags.
+  const interactiveNodes = useMemo(() => tool === 'select' || tool === 'pan' ? nodes : nodes.map((node) => ({
+    ...node, draggable: false, connectable: false, selectable: false,
+  })), [nodes, tool]);
   const setTool = useGraphStore((s) => s.setTool);
+  const [annotationColor, setAnnotationColor] = useState('#1a1a1a');
+  const [brushWidth, setBrushWidth] = useState(3);
+  const [annotationComment, setAnnotationComment] = useState(false);
+  const [annotationFontSize, setAnnotationFontSize] = useState(13);
+  const selectedNodes = nodes.filter((n) => n.selected);
+  const selectedText = tool === 'select' && selectedNodes.length === 1 && selectedNodes[0].type === 'text' ? selectedNodes[0] : null;
+  const selectedTextData = selectedText?.data as NodeDataByKind['text'] | undefined;
+  const settingsMode = tool === 'draw' ? 'draw' : tool === 'text' || selectedText ? 'text' : null;
+  const settingsColor = selectedTextData?.color ?? annotationColor;
+  const settingsComment = selectedTextData?.comment ?? annotationComment;
+  const settingsFontSize = selectedTextData?.fontSize ?? annotationFontSize;
   const wrapper = useRef<HTMLDivElement>(null);
   // Active eraser stroke (left button held); its key makes the whole stroke one undo step.
   const stroke = useRef<string | null>(null);
@@ -159,6 +178,12 @@ export function Canvas() {
     },
     [showToast],
   );
+
+  const eraseDrawingAt = (target: EventTarget) => {
+    if (tool !== 'eraser' || !stroke.current || !(target instanceof Element)) return;
+    const id = target.closest('[data-drawing-stroke]')?.getAttribute('data-drawing-stroke');
+    if (id) erase({ nodeIds: [id] }, stroke.current);
+  };
 
   useEffect(() => {
     const end = () => {
@@ -373,11 +398,17 @@ export function Canvas() {
       className={`relative h-full w-full tool-${tool}`}
       onDoubleClick={onDoubleClick}
       onPointerDownCapture={(e) => {
-        if (tool === 'eraser' && e.button === 0) stroke.current = `erase:${++strokeSeq}`;
+        if (tool === 'eraser' && e.button === 0) {
+          stroke.current = `erase:${++strokeSeq}`;
+          eraseDrawingAt(e.target);
+        }
       }}
+      onPointerOverCapture={(e) => { if (e.buttons & 1) eraseDrawingAt(e.target); }}
+      onPointerMoveCapture={(e) => { if (e.buttons & 1) eraseDrawingAt(e.target); }}
+      onPointerCancel={() => { stroke.current = null; }}
     >
       <ReactFlow<CanvasNode, CanvasEdge>
-        nodes={nodes}
+        nodes={interactiveNodes}
         edges={shownEdges}
         nodeTypes={nodeTypes}
         defaultViewport={viewport}
@@ -391,7 +422,7 @@ export function Canvas() {
         onNodeContextMenu={onNodeContextMenu}
         onEdgeContextMenu={onEdgeContextMenu}
         onNodeClick={(_, node) => {
-          if (tool === 'eraser') erase({ nodeIds: [node.id] }, stroke.current ?? undefined);
+          if (tool === 'eraser' && node.type !== 'drawing') erase({ nodeIds: [node.id] }, stroke.current ?? undefined);
         }}
         onEdgeClick={(_, edge) => {
           if (tool === 'eraser') {
@@ -401,14 +432,14 @@ export function Canvas() {
           chooseAsPrimary(edge.id);
         }}
         onNodeMouseEnter={(_, node) => {
-          if (stroke.current) erase({ nodeIds: [node.id] }, stroke.current);
+          if (stroke.current && node.type !== 'drawing') erase({ nodeIds: [node.id] }, stroke.current);
         }}
         onEdgeMouseEnter={(_, edge) => {
           if (stroke.current) erase({ edgeIds: [edge.id] }, stroke.current);
         }}
-        nodesDraggable={tool !== 'eraser'}
-        nodesConnectable={tool !== 'eraser'}
-        elementsSelectable={tool !== 'eraser'}
+        nodesDraggable={tool === 'select' || tool === 'pan'}
+        nodesConnectable={tool === 'select'}
+        elementsSelectable={tool === 'select' || tool === 'pan'}
         onMoveEnd={(_, vp) => setViewport(vp)}
         onDragOver={onDragOver}
         onDrop={onDrop}
@@ -437,8 +468,38 @@ export function Canvas() {
         defaultEdgeOptions={{ type: 'default' }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} color="#d9cfc2" />
+        {(tool === 'text' || tool === 'draw') && <AnnotationLayer tool={tool} color={annotationColor} width={brushWidth} comment={annotationComment} fontSize={annotationFontSize} />}
         {/* Two boxes: tools on top, zoom underneath. */}
-        <Panel position="bottom-left" className="flex flex-col gap-2">
+        <Panel position="bottom-left" className="flex flex-col items-start gap-2">
+          {settingsMode && <div className="react-flow__controls vertical" role="group" aria-label="Annotation settings">
+            <label className="react-flow__controls-button" title="Color">
+              <input type="color" aria-label="Annotation color" disabled={selectedTextData?.locked} value={settingsColor} onChange={(e) => {
+                if (selectedText) useGraphStore.getState().updateNodeData(selectedText.id, { color: e.target.value });
+                else setAnnotationColor(e.target.value);
+              }}
+                className="nodrag size-4 cursor-pointer border-0 bg-transparent p-0 [&::-webkit-color-swatch-wrapper]:p-0 [&::-webkit-color-swatch]:rounded-sm [&::-webkit-color-swatch]:border-0" />
+            </label>
+            {settingsMode === 'text' && <ControlButton title="Comment" aria-label="Comment" aria-pressed={settingsComment} disabled={selectedTextData?.locked}
+              className={settingsComment ? 'tool-active' : undefined} onClick={() => {
+                if (selectedText) useGraphStore.getState().updateNodeData(selectedText.id, { comment: !settingsComment });
+                else setAnnotationComment(!annotationComment);
+              }}>
+              <svg {...ICON} className="tool-icon" aria-hidden><path d="M5 3h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 4V5a2 2 0 0 1 2-2Z" /><path d="M7 8h10M7 12h6" /></svg>
+            </ControlButton>}
+            <div className="flex h-20 w-[26px] items-center justify-center bg-panel-2">
+              <input type="range" aria-label={settingsMode === 'draw' ? 'Brush width' : 'Text size'}
+                title={settingsMode === 'draw' ? `Brush width: ${brushWidth}` : `Text size: ${settingsFontSize}px`}
+                min={settingsMode === 'draw' ? 1 : 12} max={settingsMode === 'draw' ? 12 : 72}
+                value={settingsMode === 'draw' ? brushWidth : settingsFontSize} disabled={selectedTextData?.locked}
+                onChange={(e) => {
+                  const value = Number(e.target.value);
+                  if (settingsMode === 'draw') setBrushWidth(value);
+                  else if (selectedText) useGraphStore.getState().updateNodeData(selectedText.id, { fontSize: value });
+                  else setAnnotationFontSize(value);
+                }}
+                className="nodrag h-16 w-4 accent-[var(--color-accent)]" style={{ writingMode: 'vertical-lr', direction: 'rtl' }} />
+            </div>
+          </div>}
           <div className="react-flow__controls vertical" role="toolbar" aria-label="Canvas tools">
             {TOOLS.map((t) => (
               <ControlButton
@@ -488,9 +549,7 @@ export function Canvas() {
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div className="text-center">
             <p className="text-[14px] text-ink-2">Empty canvas</p>
-            <p className="mt-1 text-[12px] text-ink-3">
-              Drag a node from the sidebar, drop images here, or double-click the canvas to add a node.
-            </p>
+
           </div>
         </div>
       )}

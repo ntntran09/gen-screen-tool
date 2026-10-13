@@ -51,6 +51,29 @@ class DecodedImage:
     thumbnail: bytes
 
 
+def convert_generated_image(data: bytes, output_format: str) -> bytes:
+    """Validate provider bytes before conversion. PNG/WebP keep alpha; JPEG uses white."""
+    if output_format not in ("png", "webp", "jpg"):
+        raise AssetError("INVALID_INPUT", "Unsupported output format.")
+    decoded = decode_image(data)
+    if decoded.ext == output_format:
+        return data
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGBA")
+            buffer = io.BytesIO()
+            if output_format == "jpg":
+                image = Image.alpha_composite(Image.new("RGBA", image.size, "white"), image).convert("RGB")
+                image.save(buffer, "JPEG", quality=95, subsampling=0)
+            elif output_format == "webp":
+                image.save(buffer, "WEBP", lossless=True, exact=True)
+            else:
+                image.save(buffer, "PNG")
+            return buffer.getvalue()
+    except (OSError, ValueError) as exc:
+        raise AssetError("STORAGE_ERROR", f"Could not convert the returned image: {exc}") from exc
+
+
 def _signature_format(data: bytes) -> str | None:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "PNG"

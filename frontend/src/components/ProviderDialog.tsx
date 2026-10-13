@@ -107,10 +107,7 @@ export function ProviderDialog({ onClose, onChanged }: { onClose: () => void; on
             <h2 id="provider-dialog-title" className="text-[15px] font-semibold">
               ChatGPT / Codex
             </h2>
-            <p className="mt-0.5 text-[12px] text-ink-3">
-              Sign in with your ChatGPT account. <span className="font-semibold text-warning">Experimental</span>: uses an
-              undocumented OpenAI endpoint that may change or stop working.
-            </p>
+
           </div>
           <button type="button" aria-label="Close" className="px-1 text-ink-3 hover:text-ink" onClick={onClose}>
             ×
@@ -143,11 +140,7 @@ export function ProviderDialog({ onClose, onChanged }: { onClose: () => void; on
 
           {status?.pending && (
             <div className="space-y-3 rounded-xl border-2 border-accent/50 bg-accent-soft p-4">
-              <p className="text-[12px] text-ink-2">
-                1. Open the OpenAI page below and sign in.
-                <br />
-                2. Enter this code:
-              </p>
+
               <div className="flex items-center gap-2">
                 <code className="flex-1 rounded-lg border-2 border-outline bg-node px-3 py-2 text-center font-mono text-[20px] tracking-[0.2em] text-ink">
                   {status.pending.user_code}
@@ -162,7 +155,7 @@ export function ProviderDialog({ onClose, onChanged }: { onClose: () => void; on
               >
                 Open {new URL(status.pending.verification_url).host}
               </a>
-              <p className="text-[11px] text-ink-3">This window updates automatically once you approve. The code expires in 15 minutes.</p>
+
               <Button onClick={() => void run(() => api.cancelLogin())} disabled={busy}>
                 Cancel
               </Button>
@@ -183,10 +176,7 @@ export function ProviderDialog({ onClose, onChanged }: { onClose: () => void; on
               {status.codex_cli_login_found && (
                 <div className="rounded-lg border border-line p-3">
                   <p className="text-[12px] text-ink-2">A Codex CLI login was found on this computer.</p>
-                  <p className="mt-1 text-[11px] text-ink-3">
-                    Importing shares one session with the Codex CLI. If either app refreshes the token, the other may
-                    be signed out. Signing in separately is more reliable.
-                  </p>
+
                   <div className="mt-2">
                     <Button onClick={() => void run(() => api.connect('import_codex_cli'))} disabled={busy}>
                       Use Codex CLI login
@@ -207,7 +197,7 @@ export function ProviderDialog({ onClose, onChanged }: { onClose: () => void; on
                   checked={confirmQuota}
                   onChange={(e) => setConfirmQuota(e.target.checked)}
                 />
-                I understand this generates one real image and uses my ChatGPT usage limits.
+                Enable test generation
               </label>
               <div className="flex gap-2">
                 <Button variant="primary" onClick={() => void runTest()} disabled={busy || !confirmQuota}>

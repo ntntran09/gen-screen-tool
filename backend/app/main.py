@@ -11,10 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from .config import Settings
+from .collaboration import Rooms
 from .db import migrate
 from .generation.engine import GenerationEngine
 from .providers import build_registry
-from .routers import assets, auth, detect, generations, projects, providers
+from .routers import assets, auth, detect, generations, projects, providers, sync
 from .security import CSRF_HEADER, LocalGuardMiddleware
 
 
@@ -36,6 +37,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="NodeCanvas AI", lifespan=lifespan)
     app.state.settings = settings
     app.state.providers = build_registry(settings)
+    app.state.rooms = Rooms()
     # The registry is looked up per task so tests (and future provider settings) can swap it.
     app.state.engine = GenerationEngine(settings, lambda: app.state.providers)
 
@@ -69,10 +71,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return RedirectResponse(settings.frontend_origins[0] if settings.frontend_origins else "/docs")
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, str | bool | int]:
+        return {"status": "ok", "result_edit": True, "inline_result_edit": True, "retry_prompt": True, "prompt_parts": True, "sequential_generation": True, "concurrent_generate_nodes": True, "project_sync": True, "project_sync_version": 1, "moving_generating_nodes": True}
 
     app.include_router(projects.router)
+    app.include_router(sync.router)
     app.include_router(auth.router)
     app.include_router(assets.router)
     app.include_router(providers.router)

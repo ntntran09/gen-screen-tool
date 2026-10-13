@@ -132,7 +132,7 @@ function Workspace() {
 
   return (
     <div className="flex h-full flex-col">
-      <Toolbar onSave={() => void save()} onRename={(n) => void rename(n)} />
+      <Toolbar onSave={() => void save().catch(() => {})} onRename={(n) => void rename(n)} />
       <div className="flex min-h-0 flex-1">
         <Sidebar
           projects={projects}

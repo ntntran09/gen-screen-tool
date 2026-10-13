@@ -12,8 +12,8 @@ const SETTING_LABELS: Record<string, string> = {
   aspect_ratio: 'Aspect ratio',
   quality: 'Quality',
   output_format: 'Format',
-  background: 'Background',
-  background_value: 'Background value',
+  preset: 'Preset',
+  asset_selection: 'Asset selection',
   asset_category: 'Asset type',
   model: 'Model',
 };
@@ -113,7 +113,7 @@ function PreviewBody({ nodeId }: { nodeId: string }) {
             <p className="text-[12px] text-ink-3">
               {preview && preview.total_tasks > 0
                 ? `${preview.total_tasks} task${preview.total_tasks === 1 ? '' : 's'} · ${preview.mode === 'match' ? 'Match inputs' : 'Manual count'}`
-                : 'Compiled from the current graph. Nothing is sent.'}
+                : ''}
             </p>
           </div>
           <button type="button" className={headerBtn} disabled={loading} onClick={refresh}>
@@ -200,7 +200,7 @@ function PreviewBody({ nodeId }: { nodeId: string }) {
                 <p className="mb-1 text-[11px] font-medium text-ink-2">Requested settings</p>
                 <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
                   {Object.entries(preview.settings ?? {})
-                    .filter(([, v]) => v !== '')
+                    .filter(([k, v]) => k !== 'concurrency' && v !== '')
                     .map(([k, v]) => (
                       <div key={k} className="contents">
                         <dt className="text-ink-3">{SETTING_LABELS[k] ?? k}</dt>
@@ -208,10 +208,7 @@ function PreviewBody({ nodeId }: { nodeId: string }) {
                       </div>
                     ))}
                 </dl>
-                <p className="mt-2 text-[11px] text-ink-3">
-                  The provider's support for these settings is not verified, so they are also written into the prompt.
-                  The actual image size and format are recorded after each result arrives.
-                </p>
+
               </div>
             </div>
           )}

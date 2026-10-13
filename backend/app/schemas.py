@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-NODE_TYPES = ("prompt", "image", "original", "theme", "palette", "collection", "extract", "generate", "output")
+NODE_TYPES = ("prompt", "image", "original", "theme", "palette", "collection", "extract", "generate", "output", "text", "drawing")
 
 
 class Viewport(BaseModel):
@@ -47,6 +47,7 @@ class ProjectUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=5000)
     graph: Graph | None = None
+    graph_revision: int = Field(default=0, ge=0)
 
 
 class ProjectSummary(BaseModel):
@@ -55,6 +56,7 @@ class ProjectSummary(BaseModel):
     description: str
     created_at: str
     updated_at: str
+    graph_revision: int = 0
 
 
 class ProjectDetail(ProjectSummary):

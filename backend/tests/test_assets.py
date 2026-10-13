@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import sqlite3
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from PIL import Image
 from app.config import Settings
 from app.db import MIGRATIONS, migrate
 from app.main import create_app
+from app.assets import AssetError, convert_generated_image
 
 CSRF = {"x-nodecanvas-csrf": "1"}
 
@@ -42,6 +44,36 @@ def upload(c: TestClient, pid: str, *files: tuple[str, bytes, str]):
         files=[("files", f) for f in files],
         headers=CSRF,
     )
+
+
+def test_selected_download_zip_and_project_isolation(ctx) -> None:
+    c, pid, _ = ctx
+    raw = img_bytes()
+    assets = upload(c, pid, ("same.png", raw, "image/png"), ("same.png", raw, "image/png")).json()["imported"]
+    url = f"/api/projects/{pid}/assets/download"
+    response = c.get(url, params=[("ids", assets[0]["id"]), ("ids", assets[1]["id"]), ("ids", assets[0]["id"])])
+    assert response.status_code == 200 and response.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.namelist() == ["001_same.png", "002_same.png"]
+        assert all(archive.read(name) == raw for name in archive.namelist())
+    other = c.post("/api/projects", json={"name": "Other"}, headers=CSRF).json()["id"]
+    assert c.get(f"/api/projects/{other}/assets/download", params={"ids": assets[0]["id"]}).status_code == 404
+    assert c.get(url).status_code == 422
+    assert c.get(url, params={"ids": [assets[0]["id"]] * 201}).status_code == 422
+
+
+@pytest.mark.parametrize("fmt", ["png", "webp", "jpg"])
+def test_generated_conversion_handles_alpha(fmt) -> None:
+    data = convert_generated_image(img_bytes(mode="RGBA"), fmt)
+    with Image.open(io.BytesIO(data)) as image:
+        if fmt == "jpg":
+            assert image.mode == "RGB"
+            r, g, b = image.getpixel((0, 0))
+            assert r > 250 and 120 <= g <= 135 and 120 <= b <= 135
+        else:
+            assert image.convert("RGBA").getpixel((0, 0)) == (255, 0, 0, 128)
+    with pytest.raises(AssetError):
+        convert_generated_image(b"broken image", fmt)
 
 
 def test_import_png_jpg_webp_and_serve(ctx) -> None:

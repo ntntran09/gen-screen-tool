@@ -8,19 +8,11 @@ export interface InputPort {
   multiple: boolean;
   /** Colour of the handle when it differs from the first accepted type. */
   color?: PortType;
-  /** Must be connected for the node to run. A function decides from the node's own settings. */
-  required?: boolean | ((data: Record<string, unknown>, ctx: PortContext) => boolean);
+  /** Must be connected for the node to run. */
+  required?: boolean;
 }
 
-/** What the rest of the graph says about a node, for ports whose "required" depends on it. */
-export interface PortContext {
-  /** A Generate node that cannot run without an original image (see `generateNeedsOriginal`). */
-  needsOriginal: boolean;
-}
-
-export function isPortRequired(port: InputPort, data: Record<string, unknown>, ctx: PortContext = { needsOriginal: false }): boolean {
-  return typeof port.required === 'function' ? port.required(data, ctx) : Boolean(port.required);
-}
+export const isPortRequired = (port: InputPort) => Boolean(port.required);
 
 export interface OutputPort {
   id: string;
@@ -44,6 +36,10 @@ const base = (title: string) => ({ title, collapsed: false, locked: false });
 export const OUT = 'out';
 
 const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
+  text: { kind: 'text', label: 'Text', description: 'Canvas text', color: '#5a544d', inputs: [], outputs: [],
+    defaultData: () => ({ ...base('Text'), text: '', color: '#1a1a1a', fontSize: 13, comment: false }) },
+  drawing: { kind: 'drawing', label: 'Drawing', description: 'Freehand stroke', color: '#5a544d', inputs: [], outputs: [],
+    defaultData: () => ({ ...base('Drawing'), points: [], color: '#1a1a1a', strokeWidth: 3, canvasWidth: 1, canvasHeight: 1 }) },
   prompt: {
     kind: 'prompt',
     label: 'Prompt',
@@ -51,20 +47,7 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
     color: '#4c8df6',
     inputs: [],
     outputs: [{ id: OUT, label: 'Prompt', type: 'prompt' }],
-    defaultData: () => ({
-      ...base('Prompt'),
-      text: '',
-      constraints: '',
-      enabled: true,
-      role: 'main',
-      order: 0,
-      assetCategory: 'Item',
-      artStyle: '',
-      preserveSubject: true,
-      preserveSilhouette: true,
-      consistentFraming: true,
-      consistentScale: true,
-    }),
+    defaultData: () => ({ ...base('Prompt'), text: '', enabled: true }),
   },
   image: {
     kind: 'image',
@@ -77,15 +60,6 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
       ...base('Image'),
       assetId: null,
       notes: '',
-      instructions: '',
-      preserve: {
-        composition: false,
-        shape: true,
-        proportions: true,
-        silhouette: true,
-        mainSubject: true,
-        objectCount: false,
-      },
       roles: ['artStyle'],
     }),
   },
@@ -113,8 +87,7 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
     color: '#2bb3a3',
     inputs: [
       { id: 'in', label: 'Generated', accepts: ['generated'], multiple: false },
-      // Input collections can be filled by an Extract Assets node instead of by hand.
-      { id: 'extract', label: 'Extracted', accepts: ['extracted'], multiple: false },
+      { id: 'extract', label: 'Cropped assets', accepts: ['extracted'], multiple: false },
     ],
     outputs: [{ id: OUT, label: 'Assets', type: 'assetList' }],
     defaultData: () => ({
@@ -129,11 +102,11 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
   extract: {
     kind: 'extract',
     label: 'Extract Assets',
-    description: 'Finds the separate assets in an image with AI and cuts them out',
+    description: 'Finds the separate assets in an image with AI, then crops them into a collection for background removal',
     color: '#c9a227',
     inputs: [{ id: 'image', label: 'Image', accepts: ['image'], multiple: false, required: true }],
     outputs: [{ id: OUT, label: 'Assets', type: 'extracted' }],
-    defaultData: () => ({ ...base('Extract Assets'), hint: '', detections: null, off: [] }),
+    defaultData: () => ({ ...base('Extract Assets'), hint: '', detections: null, off: [], generateNodeId: null, collectionNodeId: null }),
   },
   generate: {
     kind: 'generate',
@@ -148,7 +121,7 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
         accepts: ['image', 'assetList'],
         multiple: true,
         color: 'original',
-        required: (_d, ctx) => ctx.needsOriginal,
+        required: true,
       },
       { id: 'reference', label: 'Reference', accepts: ['image'], multiple: true },
       { id: 'theme', label: 'Theme', accepts: ['image'], multiple: true, color: 'theme' },
@@ -159,14 +132,14 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
       ...base('Generate'),
       providerId: 'codex',
       model: '',
+      preset: 'screen',
+      assetSelection: '',
       mode: 'manual',
       outputCount: 1,
       variantsPerInput: 1,
-      aspectRatio: '1:1',
+      aspectRatio: 'match',
       quality: 'auto',
       outputFormat: 'png',
-      background: 'white',
-      backgroundValue: '',
       primaryOriginalNodeId: null,
     }),
   },
@@ -175,7 +148,10 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
     label: 'Output Image',
     description: 'A single generated result',
     color: '#b8b0a6',
-    inputs: [{ id: 'in', label: 'Generated', accepts: ['generated'], multiple: false }],
+    inputs: [
+      { id: 'in', label: 'Generated', accepts: ['generated'], multiple: false },
+      { id: 'edit', label: 'Source', accepts: ['image', 'assetList'], multiple: false },
+    ],
     outputs: [{ id: OUT, label: 'Image', type: 'image' }],
     defaultData: () => ({ ...base('Output Image'), assetId: null, generationId: null, taskId: null }),
   },
@@ -184,7 +160,7 @@ const definitions: { [K in NodeKind]: NodeDefinition<K> } = {
 export const NODE_KINDS = Object.keys(definitions) as NodeKind[];
 
 /** Kinds offered in the sidebar and add menu. Output Image nodes are created by generation, not by hand. */
-export const ADDABLE_KINDS = NODE_KINDS.filter((k) => k !== 'output');
+export const ADDABLE_KINDS = NODE_KINDS.filter((k) => !['output', 'text', 'drawing'].includes(k));
 
 export function getDefinition<K extends NodeKind>(kind: K): NodeDefinition<K> {
   return definitions[kind];
