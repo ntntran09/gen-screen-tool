@@ -23,6 +23,7 @@ import {
   type ReactNode,
 } from 'react';
 import { originalEdgeRoles, type OriginalRole } from '../graph/generation';
+import { mainClusterBounds } from '../graph/mainCluster';
 import { getDefinition, isNodeKind } from '../graph/registry';
 import type { CanvasEdge, CanvasNode, CollectionData, NodeKind } from '../graph/types';
 import { checkConnection } from '../graph/validation';
@@ -140,7 +141,7 @@ export function Canvas() {
   const commit = useGraphStore((s) => s.commit);
   const setViewport = useGraphStore((s) => s.setViewport);
   const showToast = useGraphStore((s) => s.showToast);
-  const { screenToFlowPosition, setViewport: applyViewport, zoomIn, zoomOut, fitView } = useReactFlow();
+  const { screenToFlowPosition, setViewport: applyViewport, zoomIn, zoomOut, fitView, fitBounds } = useReactFlow();
   const importImages = useImageImport();
   const placeAssets = useAssetPlacement();
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
@@ -243,10 +244,17 @@ export function Canvas() {
     [erase],
   );
 
-  // Restore the saved viewport whenever a different project is loaded.
+  // Restore this tab's viewport when a project is loaded. A tab that has never opened the project
+  // (e.g. another machine) has none: the viewport stored on the server is stale because sync keeps
+  // it local, so open on the main cluster of nodes instead.
   useEffect(() => {
-    if (projectId) void applyViewport(useGraphStore.getState().viewport);
-  }, [projectId, applyViewport]);
+    if (!projectId) return;
+    let seen = true;
+    try { seen = sessionStorage.getItem(`nodecanvas:viewport:${projectId}`) !== null; } catch { /* storage unavailable */ }
+    const bounds = seen ? null : mainClusterBounds(useGraphStore.getState().nodes);
+    if (bounds) void fitBounds(bounds, { padding: 0.15 });
+    else void applyViewport(useGraphStore.getState().viewport);
+  }, [projectId, applyViewport, fitBounds]);
 
   const isValidConnection: IsValidConnection<CanvasEdge> = useCallback(
     (c) => {
