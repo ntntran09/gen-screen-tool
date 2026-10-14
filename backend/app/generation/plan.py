@@ -444,6 +444,13 @@ def build_plan(
                 for c in palette
             ]
             notes.append("- Color palette: use " + ", ".join(colors) + ".")
+        if palette or theme_ids:
+            notes.append(
+                "- Keep the main gameplay objects vivid. Even if the palette or style references are muted or pale, they "
+                "must stay saturated, high-contrast and clearly stand out from the background, supports and HUD. Use the "
+                "palette and style references for the overall look and secondary elements, not to wash out the key objects. "
+                "Objects that are told apart by color for gameplay must keep their original colors; other elements may follow the palette and theme."
+            )
         if source and source.override:
             notes.append(f"- For this image: {fill(source.override)}")
         aspect = settings["aspect_ratio"]

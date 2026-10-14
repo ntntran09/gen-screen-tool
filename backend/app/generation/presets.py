@@ -37,6 +37,18 @@ The original screenshot is the source of truth for:
 Maintain a one-to-one correspondence between original and restyled
 gameplay elements. Do not add, remove, rearrange or invent mechanics.
 
+PRESERVE GAMEPLAY COLORS
+Some gameplay objects are told apart by color, such as flowers, pieces
+or items of different colors. For those objects only, keep the original
+color identity: a blue flower stays blue and a red flower stays red,
+and objects that were different colors must remain clearly different
+colors. Keep the same number of distinct colors as in the original.
+The theme may change their form, material and detail, not the hue that
+identifies them.
+Everything else, such as the background, supports, containers that do
+not identify gameplay, HUD frames and decoration, may freely take the
+theme's colors.
+
 PRESERVE EXISTING HUD
 Keep all existing gameplay HUD, including level, score, timer,
 progress indicators and buttons.
@@ -77,6 +89,8 @@ Within those requirements, prioritize:
 - Clear silhouettes and solid, well-defined volumes.
 - Attractive proportions and consistent visual scale.
 - Bright, harmonious colors and clear visual hierarchy.
+- Main gameplay objects that are vivid, saturated and clearly stand out
+  from the background, supports and HUD, whatever the overall style.
 - Consistent lighting and restrained contact shadows.
 - Clean materials and controlled surface detail.
 - Immediate readability at mobile screen size.
@@ -94,7 +108,8 @@ Keep requested gameplay effects localized to the relevant objects.
 
 PRIORITIES
 1. Preserve core gameplay: mechanics, object functions and quantities,
-   layout and existing HUD information.
+   layout, existing HUD information and the original colors of
+   objects that are told apart by color.
 2. Re-theme the assets to the user request as fully as possible.
 3. Follow the art direction notes.
 4. Improve visual polish without violating the above.
@@ -135,6 +150,10 @@ Containers must remain containers, flowers must remain flowers,
 and obstacles must remain recognizable gameplay obstacles.
 Do not replace objects with pets or characters unless requested.
 A material change must not alter their gameplay role.
+
+If assets are told apart by color (for example flowers of different
+colors), keep each one's original color identity and keep them clearly
+different. Other assets may take the theme's colors.
 
 Preserve gameplay states unless the user explicitly requests a change.
 Create shared obstacle effects as separate reusable assets when they

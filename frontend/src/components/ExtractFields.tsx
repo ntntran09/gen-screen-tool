@@ -5,8 +5,10 @@ import { assetUrls } from '../lib/api';
 import { useAssetStore } from '../store/assetStore';
 import { useExtractStore } from '../store/extractStore';
 import { useGraphStore } from '../store/graphStore';
-import { Button, Section, TextInput } from './fields';
+import { Button, Section, Select, TextInput } from './fields';
 import { CropEditor } from './CropEditor';
+
+const VISION_MODELS = ['gpt-6-luna', 'gpt-5.6-luna'];
 
 /** Inspector for an Extract Assets node: find the assets, review them, then crop them and build background removal. */
 export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: ExtractData; update: (p: Partial<ExtractData>) => void }) {
@@ -44,17 +46,16 @@ export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: 
         ) : (
           <p className="text-[12px] text-warning">Image required.</p>
         )}
-        <TextInput
+        <Select
           label="Model"
           value={data.model ?? ''}
-          onChange={(model) => update({ model: model.trim() })}
-          placeholder="Default (gpt-6-luna, then gpt-5.6-luna)"
-          list="extract-models"
+          options={[
+            { value: '', label: 'Default' },
+            ...[...VISION_MODELS, ...(data.model && !VISION_MODELS.includes(data.model) ? [data.model] : [])].map((m) => ({ value: m, label: m })),
+          ]}
+          onChange={(model) => update({ model })}
+          hint="Default tries gpt-6-luna, then gpt-5.6-luna."
         />
-        <datalist id="extract-models">
-          <option value="gpt-6-luna" />
-          <option value="gpt-5.6-luna" />
-        </datalist>
         <TextInput label="Find" value={data.hint} onChange={(hint) => update({ hint })} placeholder="e.g. flowers and pots only; no HUD" />
         <Button variant="primary" disabled={!assetId || busy !== undefined} onClick={() => void detect(nodeId)}>
           {busy === 'detect' ? 'Looking…' : found ? 'Find again' : 'Find assets'}

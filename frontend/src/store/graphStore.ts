@@ -196,8 +196,10 @@ function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
   return { nodes, edges };
 }
 
+const STYLE_SOURCE_TITLE = 'Source style';
 const EXTRACT_PROMPT_V1 = 'Isolate the target asset specified in the per-image instructions from this crop. Remove the background and all other objects, including neighboring or attached components that are not part of the target. Keep only the target asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. Do not restyle, add other objects or create multiple copies. Return one isolated asset.';
-export const EXTRACT_PROMPT = 'Isolate the target asset specified in the per-image instructions from this crop. Remove the background and all other objects, including neighboring or attached components that are not part of the target. Keep only the target asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. When the per-image instructions describe the request the source image was made from, use it to understand the intended theme, materials and style, and redraw the asset so it clearly belongs to that theme, including parts the crop hides or blurs. Do not change what the asset is, add other objects or create multiple copies. Return one isolated asset.';
+const EXTRACT_PROMPT_V2 = 'Isolate the target asset specified in the per-image instructions from this crop. Remove the background and all other objects, including neighboring or attached components that are not part of the target. Keep only the target asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. When the per-image instructions describe the request the source image was made from, use it to understand the intended theme, materials and style, and redraw the asset so it clearly belongs to that theme, including parts the crop hides or blurs. Do not change what the asset is, add other objects or create multiple copies. Return one isolated asset.';
+export const EXTRACT_PROMPT = 'Isolate the target asset specified in the per-image instructions from this crop. Remove the background and all other objects, including neighboring or attached components that are not part of the target. Keep only the target asset on a transparent background. Reproduce the asset faithfully: the same rendering style as the crop and the attached style reference (outline weight, shading, texture, level of detail), the same colors, shape, proportions and integral text. When the per-image instructions describe the request the source image was made from, use it to understand the intended theme and materials, and redraw hidden or blurry parts consistently with it. Do not redesign, beautify or restyle it, change its proportions, add other objects or create multiple copies. Return one isolated asset.';
 
 /** Old projects had separate Original / Theme nodes; both are an Image node now (role = port). */
 function upgradeLegacyNode<T extends { type: string; data: Record<string, unknown> }>(n: T): T {
@@ -621,9 +623,23 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       nextNodes = nextNodes.map((n) => {
         if (n.id === extractNodeId) return { ...n, data: { ...n.data, generateNodeId: generate.id, collectionNodeId: collection.id } as AnyNodeData };
         if (n.id === oldGenerate?.id) return generate;
-        if (n.id === promptEdge?.source && ['Keep the original art style.', EXTRACT_PROMPT_V1, 'Remove the background from this cropped asset. Keep only the main asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. Do not restyle, add other objects or create multiple copies. Return one isolated asset.'].includes(String(n.data.text))) return { ...n, data: { ...n.data, text: EXTRACT_PROMPT, title: 'Remove background' } as AnyNodeData };
+        if (n.id === promptEdge?.source && ['Keep the original art style.', EXTRACT_PROMPT_V1, EXTRACT_PROMPT_V2, 'Remove the background from this cropped asset. Keep only the main asset on a transparent background. Preserve its original art style, colors, shape, proportions, details and integral text. Do not restyle, add other objects or create multiple copies. Return one isolated asset.'].includes(String(n.data.text))) return { ...n, data: { ...n.data, text: EXTRACT_PROMPT, title: 'Remove background' } as AnyNodeData };
         return n;
       });
+      // The crop alone is tiny: attach the whole source image as a style reference so the asset is
+      // redrawn in the same rendering style instead of being redesigned.
+      const styleEdge = oldGenerate && edges.find((e) => e.target === oldGenerate.id && e.targetHandle === 'theme'
+        && nodes.find((n) => n.id === e.source)?.data.title === STYLE_SOURCE_TITLE);
+      const styleOld = styleEdge ? nodes.find((n) => n.id === styleEdge.source) : undefined;
+      const styleNode = styleOld
+        ? { ...styleOld, data: { ...styleOld.data, assetId } as AnyNodeData }
+        : withFlags({
+            id: uuid(), type: 'image', position: { x: collection.position.x, y: collection.position.y + 330 },
+            data: { ...getDefinition('image').defaultData(), title: STYLE_SOURCE_TITLE, assetId,
+              roles: ['artStyle', 'shading', 'material', 'texture'] } as AnyNodeData,
+          });
+      if (styleOld) nextNodes = nextNodes.map((n) => (n.id === styleOld.id ? styleNode : n));
+      else nextNodes.push(styleNode);
       if (!oldGenerate) nextNodes.push(generate);
       if (prompt) nextNodes.push(prompt);
       set({
@@ -632,6 +648,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
           ...edges.filter((e) => !(e.target === generate.id && e.targetHandle === 'original') && !(e.target === collection.id && e.targetHandle === 'extract')),
           wire(extractNodeId, collection.id, 'extract'), wire(collection.id, generate.id, 'original'),
           ...(prompt ? [wire(prompt.id, generate.id, 'prompt')] : []),
+          ...(styleOld ? [] : [wire(styleNode.id, generate.id, 'theme')]),
         ],
       });
       touch();

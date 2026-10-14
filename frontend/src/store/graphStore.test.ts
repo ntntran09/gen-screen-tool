@@ -251,7 +251,7 @@ describe('extraction workflow', () => {
       { name: 'blue pot', x: .1, y: .1, w: .2, h: .2 },
       { name: 'cat', x: 0, y: .85, w: .2, h: .15 },
     ]);
-    expect(s().nodes).toHaveLength(before + 3);
+    expect(s().nodes).toHaveLength(before + 4); // collection, prompt, Generate and the style source
     expect((get(made.collection).data as CollectionData).items.map((i) => i.assetId)).toEqual(['crop-0-blue pot', 'crop-1-cat']);
     expect(get(made.prompt!).data.text).toBe(EXTRACT_PROMPT);
     const cropItems = (get(made.collection).data as CollectionData).items;
@@ -263,6 +263,8 @@ describe('extraction workflow', () => {
     expect(s().edges.map((e) => [e.source, e.target, e.targetHandle])).toEqual(expect.arrayContaining([
       [ex, made.collection, 'extract'], [made.collection, made.generate, 'original'], [made.prompt, made.generate, 'prompt'],
     ]));
+    const style = s().edges.find((e) => e.target === made.generate && e.targetHandle === 'theme');
+    expect(get(style!.source).data).toMatchObject({ assetId: 'screen', title: 'Source style' }); // whole screen as style reference
     s().undo();
     expect(s().nodes).toHaveLength(before);
     expect(get(ex).data.collectionNodeId).toBeNull();
@@ -277,6 +279,7 @@ describe('extraction workflow', () => {
     const again = (await s().addExtractionWorkflow(ex))!;
     expect(again).toMatchObject({ collection: first.collection, generate: first.generate, created: false });
     expect(s().nodes).toHaveLength(count);
+    expect(s().edges.filter((e) => e.target === first.generate && e.targetHandle === 'theme')).toHaveLength(1);
     expect((get(first.collection).data as CollectionData).items).toHaveLength(1);
     expect(get(first.prompt!).data.text).toBe('Remove bg, keep shadows.');
   });

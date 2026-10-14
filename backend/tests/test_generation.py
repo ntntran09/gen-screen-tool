@@ -278,6 +278,17 @@ def test_each_prompt_gets_the_full_set_of_outputs() -> None:
     assert len(one.tasks) == 2 and one.tasks[0].prompt_count == 1  # a disabled prompt adds nothing
 
 
+def test_vivid_objects_note_appears_with_a_theme_image_or_palette_only() -> None:
+    base = [gen(), prompt(), orig()]
+    edges = [edge("p", "g", "prompt"), edge("orig", "g", "original")]
+    marker = "Keep the main gameplay objects vivid."
+    assert marker not in plan(graph(base, edges)).tasks[0].prompt
+    theme = node("t", "image", assetId="t1", roles=["artStyle"], notes="")
+    assert marker in plan(graph([*base, theme], [*edges, edge("t", "g", "theme")])).tasks[0].prompt
+    pal = node("pal", "palette", colors=[{"hex": "#ff0000", "role": "primary", "ratio": 60}])
+    assert marker in plan(graph([*base, pal], [*edges, edge("pal", "g", "palette")])).tasks[0].prompt
+
+
 def test_the_task_limit_counts_every_prompt() -> None:
     edges = [edge("p", "g", "prompt"), edge("p2", "g", "prompt"), edge("orig", "g", "original")]
     errs = errors_of(graph([gen(outputCount=150), prompt("A"), prompt("B", "p2"), orig()], edges))
@@ -307,6 +318,10 @@ def test_the_prompt_is_the_chosen_preset_with_the_request_and_the_extras() -> No
         "- Attached image 1 is the original game screenshot.",
         "- Style references: attached image 2 is style references. Follow their art style and lighting. Glossy. Do not copy their subjects.",
         "- Color palette: use primary #FF0000 (about 60%).",
+        "- Keep the main gameplay objects vivid. Even if the palette or style references are muted or pale, they "
+        "must stay saturated, high-contrast and clearly stand out from the background, supports and HUD. Use the "
+        "palette and style references for the overall look and secondary elements, not to wash out the key objects. "
+        "Objects that are told apart by color for gameplay must keep their original colors; other elements may follow the palette and theme.",
         "- Requested output aspect ratio: 1:1. This overrides any aspect-ratio rule above.",
     ]
 

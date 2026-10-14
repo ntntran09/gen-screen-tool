@@ -26,15 +26,12 @@ export function TextInput(props: {
   hint?: ReactNode;
   onBlur?: () => void;
   onEnter?: () => void;
-  /** id of a <datalist> offering suggestions. */
-  list?: string;
 }) {
   return (
     <Field label={props.label} hint={props.hint}>
       {(id) => (
         <input
           id={id}
-          list={props.list}
           className={inputCls}
           value={props.value}
           placeholder={props.placeholder}
