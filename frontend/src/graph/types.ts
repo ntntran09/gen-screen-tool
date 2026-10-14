@@ -15,12 +15,19 @@ export interface BaseNodeData {
   title: string;
   collapsed: boolean;
   locked: boolean;
+  /**
+   * Set while this node is folded into another node's generate button (the Cropped assets collection of an
+   * Extract flow): it is hidden but still part of the graph, so planning and generation are unchanged.
+   */
+  groupId?: string | null;
   inlineGeneration?: {
     id: string;
     assetId: string;
     prompt: string;
     settings: Partial<GenerateData>;
     batchIds: string[];
+    /** Variation: the images this result came from (the original screenshot), sent along as secondary originals for context. */
+    contextAssetIds?: string[];
   };
   [key: string]: unknown;
 }
@@ -91,13 +98,15 @@ export interface CollectionData extends BaseNodeData {
   batchIds: string[];
   /** Output collections: tasks already added, so a removed result is not added back on re-sync. */
   syncedTaskIds: string[];
+  /** Input collections that own a folded Extract workflow: the Prompt, Generate and style Image nodes hidden behind its button. */
+  foldedIds?: string[];
 }
 
 /** `match` = closest preset to the original image's shape (resolved per task by the backend). */
 export const ASPECT_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9', 'match'] as const;
 export const aspectLabel = (a: string) => (a === 'match' ? 'Match original' : a);
 
-/** The only two prompt presets. The wording lives in the backend (`generation/presets.py`). */
+/** The prompt presets. The wording lives in the backend (`generation/presets.py`). */
 export const PRESETS = [
   {
     id: 'screen',
@@ -109,14 +118,21 @@ export const PRESETS = [
     label: 'Asset sheet',
     description: 'Create a clean sheet of the gameplay assets in the image, in the requested style, on a transparent background.',
   },
+  {
+    id: 'free',
+    label: 'Free prompt',
+    description: 'Your prompt goes to the model as written, with no game template. Attached images, palette and aspect ratio are still described.',
+  },
 ] as const;
 export type PresetId = (typeof PRESETS)[number]['id'];
 
 /** Find boxes; Build asset sheet crops selected assets into a collection and adds background removal. */
 export interface ExtractData extends BaseNodeData {
   hint: string;
-  /** Vision model used to find assets; empty uses the server default. Reasoning effort is fixed at low. */
+  /** Vision model used to find assets; empty uses the server default (Luna). */
   model?: string;
+  /** Thinking effort; empty is automatic: maximum for Luna, light for larger models. */
+  effort?: string;
   /** Result of the last search, for the image it was run on (ignored once that image changes). */
   detections: { assetId: string; model: string | null; seconds: number; items: DetectedAsset[] } | null;
   /** Indexes of detections the user unticked. */

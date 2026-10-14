@@ -1,6 +1,6 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { api, type GenerationBatch, type GenerationTask } from '../lib/api';
-import { useGenerationStore } from './generationStore';
+import { failureReasons, useGenerationStore, variationContext } from './generationStore';
 import { useGraphStore } from './graphStore';
 
 const g = () => useGraphStore.getState();
@@ -157,6 +157,43 @@ it.each(['Make the flowers pink', ''])('creates a directly connected Varied resu
   expect(s().starting).toEqual({});
 });
 
+it('a variation sends the original image along as a secondary original, for context', async () => {
+  const old = g().addNode('output', { x: 0, y: 0 }, { assetId: 'old', generationId: 'batch', taskId: 'one' });
+  // The result 'old' was made from 'original' (plus a second original) in batch 'batch'.
+  const made: GenerationTask = { ...task('one', 1, 'old'), request: { ...task('one', 1, 'old').request, original_asset_id: 'original', extra_original_asset_ids: ['second', 'old'] } };
+  // A finished batch: a result of a running batch is frozen and cannot be varied.
+  useGenerationStore.setState({ batches: { batch: { ...batch, status: 'completed' } }, tasks: { batch: [made] } });
+  vi.spyOn(api, 'updateProject').mockResolvedValue(undefined as never);
+  let sent: Parameters<typeof api.startGeneration>[0] | undefined;
+  vi.spyOn(api, 'startGeneration').mockImplementation(async (body) => {
+    sent = body;
+    return { batch: { ...batch, id: body.batch_id!, generate_node_id: body.generate_node_id }, tasks: [{ ...task('varied', 1, 'new'), batch_id: body.batch_id! }] };
+  });
+  expect(await s().vary(old, 'old', '', 'batch', 'one')).toBe(true);
+  const nodes = sent!.graph!.nodes;
+  const generate = nodes.find((n) => n.id === sent!.generate_node_id)!;
+  const originals = sent!.graph!.edges.filter((e) => e.target === generate.id && e.targetHandle === 'original').map((e) => e.source);
+  expect(originals).toHaveLength(3); // the varied image, the original and the second original
+  expect(originals[0]).toBe(old);
+  expect(generate.data.primaryOriginalNodeId).toBe(old); // the varied image stays image 1
+  expect(nodes.filter((n) => originals.slice(1).includes(n.id)).map((n) => n.data.assetId).sort()).toEqual(['original', 'second']);
+});
+
+it('a retry does not carry the original image along', async () => {
+  const old = g().addNode('output', { x: 0, y: 0 }, { assetId: 'old', generationId: 'batch', taskId: 'one' });
+  g().placeInlineResult(old, 'old', 'Make it pink', 'b2', {}, undefined, undefined, undefined, ['original']);
+  expect(g().nodes.find((n) => n.id === old)!.data.inlineGeneration?.contextAssetIds).toEqual(['original']);
+  g().placeInlineResult(old, 'old', 'Make it blue', 'b3', {}, { slot_index: 0, attempt_number: 2 }); // a retry passes no context
+  expect(g().nodes.find((n) => n.id === old)!.data.inlineGeneration?.contextAssetIds).toBeUndefined();
+});
+
+it('variationContext lists the originals of a result, without the result itself or duplicates', () => {
+  const made = { ...task('one', 1, 'old'), request: { ...task('one', 1, 'old').request, original_asset_id: 'a', extra_original_asset_ids: ['b', 'a', 'old', ''] } };
+  expect(variationContext(made, 'old')).toEqual(['a', 'b']);
+  expect(variationContext(undefined, 'old')).toEqual([]);
+  expect(variationContext({ ...made, request: { ...made.request, original_asset_id: null, extra_original_asset_ids: undefined } }, 'old')).toEqual([]);
+});
+
 it('removes the empty variation result when submission fails', async () => {
   const old = g().addNode('output', { x: 0, y: 0 }, { assetId: 'old' });
   vi.spyOn(api, 'updateProject').mockResolvedValue(undefined as never);
@@ -201,3 +238,23 @@ it('protects an output collection while its batch runs', () => {
   g().onNodesChange([{ type: 'remove', id: collection.id }]);
   expect(g().nodes.some((n) => n.id === collection.id)).toBe(true);
 });
+
+it('groups the latest failed attempts by their real error message', () => {
+  const failed = (id: string, slot: number, attempt: number, message: string | null, status: GenerationTask['status'] = 'failed'): GenerationTask =>
+    ({ ...task(id, attempt, ''), slot_index: slot, status, error_code: 'NETWORK_ERROR', error_message: message, output_asset_id: null });
+  const reasons = failureReasons([
+    failed('a', 0, 1, 'Network error while contacting ChatGPT. Result unknown.'),
+    failed('b', 1, 1, 'Network error while contacting ChatGPT. Result unknown.'),
+    failed('c', 2, 1, 'Your request was rejected by the safety system.'),
+    failed('d', 3, 1, 'Old error'), failed('e', 3, 2, null, 'completed'), // retried and succeeded: no longer a failure
+    failed('f', 4, 1, null), // no message: falls back to the code
+    { ...task('g', 1, 'x'), slot_index: 5 }, // completed
+  ]);
+  expect(reasons).toEqual([
+    { message: 'Network error while contacting ChatGPT. Result unknown.', count: 2 },
+    { message: 'Your request was rejected by the safety system.', count: 1 },
+    { message: 'NETWORK_ERROR', count: 1 },
+  ]);
+  expect(failureReasons(undefined)).toEqual([]);
+});
+

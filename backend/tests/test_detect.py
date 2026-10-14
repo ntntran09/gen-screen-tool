@@ -79,7 +79,7 @@ class Scripted(ImageProvider):
     name = "Scripted"
 
     def __init__(self, answers: list[Any]) -> None:
-        self.answers, self.models = answers, []
+        self.answers, self.models, self.efforts = answers, [], []
 
     async def authenticate(self):  # type: ignore[no-untyped-def,override]
         return "connected"
@@ -102,8 +102,11 @@ class Scripted(ImageProvider):
     def normalize_error(self, exc: BaseException) -> ProviderError:
         return ProviderError("UNKNOWN_ERROR", str(exc))
 
-    async def analyze_image(self, image: bytes, prompt: str, *, instructions: str, model: str) -> AnalysisResult:
+    async def analyze_image(
+        self, image: bytes, prompt: str, *, instructions: str, model: str, effort: str = "low"
+    ) -> AnalysisResult:
         self.models.append(model)
+        self.efforts.append(effort)
         answer = self.answers.pop(0)
         if isinstance(answer, ProviderError):
             raise answer
@@ -128,7 +131,7 @@ def test_hint_reaches_the_prompt() -> None:
     seen: list[str] = []
 
     class Spy(Scripted):
-        async def analyze_image(self, image, prompt, *, instructions, model):  # type: ignore[no-untyped-def]
+        async def analyze_image(self, image, prompt, *, instructions, model, effort="low"):  # type: ignore[no-untyped-def]
             seen.append(prompt)
             return AnalysisResult(text=GOOD)
 
@@ -171,11 +174,12 @@ def test_codex_sends_a_responses_request_with_the_image_and_reads_streamed_text(
             ),
         )
 
-    result = asyncio.run(codex(tmp_path, handler).analyze_image(png(), "find", instructions="json", model="gpt-6-luna"))
+    result = asyncio.run(codex(tmp_path, handler).analyze_image(png(), "find", instructions="json", model="gpt-6-luna", effort="max"))
     assert result.text == '{"assets": []}' and result.reported_model == "gpt-6-luna-2026"
     body = seen["body"]
     assert seen["url"] == f"{BASE_URL}/responses"
     assert (body["model"], body["stream"], body["store"], body["instructions"]) == ("gpt-6-luna", True, False, "json")
+    assert body["reasoning"] == {"effort": "max"}
     content = body["input"][0]["content"]
     assert content[0] == {"type": "input_text", "text": "find"}
     assert content[1]["type"] == "input_image" and content[1]["image_url"].startswith("data:image/png;base64,")
@@ -286,3 +290,20 @@ def test_detect_endpoint_uses_only_the_chosen_model_and_rejects_odd_names(ctx) -
     assert provider.models == ["my-model.1"]  # no fallback list when a model is chosen
     bad = c.post(f"/api/assets/{a}/detect", json={"provider_id": "scripted", "model": "x y;z"}, headers=CSRF)
     assert bad.status_code == 422 or bad.status_code == 400
+
+
+def test_effort_defaults_to_max_for_luna_and_low_for_larger_models_unless_chosen() -> None:
+    p = Scripted([GOOD, GOOD, GOOD])
+    asyncio.run(detect_assets(p, png(), ("gpt-6-luna",)))
+    asyncio.run(detect_assets(p, png(), ("gpt-6.1-sol",)))
+    asyncio.run(detect_assets(p, png(), ("gpt-6-luna",), effort="medium"))
+    assert p.efforts == ["max", "low", "medium"]
+
+
+def test_detect_endpoint_takes_an_effort_and_rejects_unknown_ones(ctx) -> None:
+    c, pid, provider = ctx
+    a = upload(c, pid, png((200, 100)))
+    res = c.post(f"/api/assets/{a}/detect", json={"provider_id": "scripted", "model": "gpt-6.1-sol", "effort": "high"}, headers=CSRF)
+    assert res.status_code == 200 and provider.efforts == ["high"]
+    bad = c.post(f"/api/assets/{a}/detect", json={"provider_id": "scripted", "effort": "ultra-mega"}, headers=CSRF)
+    assert bad.status_code in (400, 422)

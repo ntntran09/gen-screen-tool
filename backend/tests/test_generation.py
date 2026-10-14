@@ -289,6 +289,37 @@ def test_vivid_objects_note_appears_with_a_theme_image_or_palette_only() -> None
     assert marker in plan(graph([*base, pal], [*edges, edge("pal", "g", "palette")])).tasks[0].prompt
 
 
+def test_variation_keeps_the_original_image_as_a_secondary_original() -> None:
+    nodes = [gen(editResult=True, primaryOriginalNodeId="result"), prompt("Create a subtle variation."),
+             node("result", "output", assetId="a2"), orig("context", "a1")]
+    edges = [edge("p", "g", "prompt"), edge("result", "g", "original"), edge("context", "g", "original")]
+    p = plan(graph(nodes, edges))
+    task = p.tasks[0]
+    assert task.original_asset_id == "a2" and task.extra_original_asset_ids == ["a1"]  # the varied image is image 1
+    assert "Attached image 1 is the image to edit." in task.prompt
+    assert "- Context: attached image 2 is the original image(s) this result was made from." in task.prompt
+    assert "edit image 1." in task.prompt
+    assert task.operation == "edit"
+
+
+def test_free_prompt_sends_the_request_as_written_without_the_game_template() -> None:
+    from app.generation.prompt_parts import split_prompt
+
+    theme = node("t", "image", assetId="t1", roles=["artStyle"], notes="")
+    edges = [edge("p", "g", "prompt"), edge("orig", "g", "original"), edge("t", "g", "theme")]
+    p = plan(graph([gen(preset="free"), prompt("Turn the flowers into paper cut-outs."), orig(), theme], edges))
+    text = p.tasks[0].prompt
+    assert text.startswith("Turn the flowers into paper cut-outs.")
+    for game_only in ("You are a professional mobile game", "PRESERVE GAMEPLAY", "THE STYLE MUST REACH", "Keep the main gameplay objects vivid."):
+        assert game_only not in text
+    assert "ADDITIONAL INPUTS" in text and "Attached image 1 is the original image." in text  # inputs are still described
+    assert "Style references:" in text
+    assert p.settings["preset"] == "free"
+    # The editable request is recovered exactly, so Retry shows what the user wrote.
+    assert split_prompt(text, p.settings)["user_prompt"] == "Turn the flowers into paper cut-outs."
+    assert any("original image" in e for e in errors_of(graph([gen(preset="free"), prompt()], [edge("p", "g", "prompt")])))
+
+
 def test_the_task_limit_counts_every_prompt() -> None:
     edges = [edge("p", "g", "prompt"), edge("p2", "g", "prompt"), edge("orig", "g", "original")]
     errs = errors_of(graph([gen(outputCount=150), prompt("A"), prompt("B", "p2"), orig()], edges))
@@ -321,7 +352,7 @@ def test_the_prompt_is_the_chosen_preset_with_the_request_and_the_extras() -> No
         "- Keep the main gameplay objects vivid. Even if the palette or style references are muted or pale, they "
         "must stay saturated, high-contrast and clearly stand out from the background, supports and HUD. Use the "
         "palette and style references for the overall look and secondary elements, not to wash out the key objects. "
-        "Objects that are told apart by color for gameplay must keep their original colors; other elements may follow the palette and theme.",
+        "Objects that are told apart by color for gameplay must keep their original colors but still be redrawn in the theme's art style; other elements may follow the palette and theme.",
         "- Requested output aspect ratio: 1:1. This overrides any aspect-ratio rule above.",
     ]
 

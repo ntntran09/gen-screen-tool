@@ -44,12 +44,12 @@ describe('extract store', () => {
     const spy = vi.spyOn(api, 'detectAssets').mockResolvedValue({ asset_id: 'screen', model: 'gpt-6-luna', elapsed_seconds: 7, assets: found });
     g().updateNodeData(ex, { hint: 'pots', off: [2] });
     await useExtractStore.getState().detect(ex);
-    expect(spy).toHaveBeenCalledWith('screen', 'codex', 'pots', '');
+    expect(spy).toHaveBeenCalledWith('screen', 'codex', 'pots', '', '');
     expect(data(ex).detections).toMatchObject({ assetId: 'screen', model: 'gpt-6-luna' });
     expect(data(ex).off).toEqual([]); // a new search starts with everything ticked
-    g().updateNodeData(ex, { model: 'gpt-5.6-luna' });
+    g().updateNodeData(ex, { model: 'gpt-6.1-sol', effort: 'high' });
     await useExtractStore.getState().detect(ex);
-    expect(spy).toHaveBeenLastCalledWith('screen', 'codex', 'pots', 'gpt-5.6-luna');
+    expect(spy).toHaveBeenLastCalledWith('screen', 'codex', 'pots', 'gpt-6.1-sol', 'high');
     expect(currentDetections(data(ex), sourceAssetFor(g().nodes, g().edges, ex))?.items).toHaveLength(3);
     g().updateNodeData(img, { assetId: 'other' });
     expect(currentDetections(data(ex), sourceAssetFor(g().nodes, g().edges, ex))).toBeNull(); // stale: the image changed

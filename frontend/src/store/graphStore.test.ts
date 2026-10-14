@@ -70,6 +70,45 @@ describe('graph store', () => {
     expect(s().edges).toHaveLength(1);
   });
 
+  it('ungroups an inline generation into a real Prompt and Generate node that keep its history', () => {
+    const source = s().addNode('output', { x: 0, y: 0 }, { assetId: 'result' });
+    const id = s().placeInlineResult(source, 'result', 'Make it pink', 'batch-1', { providerId: 'fake', quality: 'high' })!;
+    const result = s().nodes.find((n) => n.type === 'output' && n.id !== source)!;
+    expect(s().ungroupInlineGeneration(source)).toBe(true);
+    const generate = s().nodes.find((n) => n.id === id)!; // the inline generation's id: earlier batches stay attached
+    expect(generate.type).toBe('generate');
+    expect(generate.data).toMatchObject({ providerId: 'fake', quality: 'high', editResult: true, mode: 'manual', outputCount: 1 });
+    const prompt = s().nodes.find((n) => n.type === 'prompt')!;
+    expect(prompt.data.text).toBe('Make it pink');
+    expect(s().nodes.find((n) => n.id === source)!.data.inlineGeneration).toBeUndefined(); // the sparkle button is gone
+    const wires = s().edges.map((e) => [e.source, e.target, e.targetHandle]);
+    expect(wires).toEqual(expect.arrayContaining([[prompt.id, id, 'prompt'], [source, id, 'original'], [id, result.id, 'in']]));
+    s().undo();
+    expect(s().nodes.find((n) => n.id === source)!.data.inlineGeneration).toMatchObject({ id });
+    expect(s().nodes.some((n) => n.id === id)).toBe(false);
+  });
+
+  it('ungrouping an inline generation on a collection adds an Image node for the chosen asset', () => {
+    const source = s().addNode('collection', { x: 0, y: 0 }, { role: 'output', items: [
+      { id: 'a', assetId: 'a', enabled: true, promptOverride: '' },
+      { id: 'b', assetId: 'b', enabled: true, promptOverride: '' },
+    ] });
+    s().placeInlineResult(source, 'b', 'Make it pink', 'batch-1');
+    expect(s().ungroupInlineGeneration(source)).toBe(true);
+    const image = s().nodes.find((n) => n.type === 'image')!;
+    expect(image.data.assetId).toBe('b');
+    expect(s().edges.some((e) => e.source === image.id && e.targetHandle === 'original')).toBe(true);
+  });
+
+  it('will not ungroup an inline generation while it is running', () => {
+    const source = s().addNode('output', { x: 0, y: 0 }, { assetId: 'result' });
+    const id = s().placeInlineResult(source, 'result', 'Make it pink', 'batch-1')!;
+    s().setFrozen([id]);
+    expect(s().ungroupInlineGeneration(source)).toBe(false);
+    expect(s().nodes.find((n) => n.id === source)!.data.inlineGeneration).toBeTruthy();
+    s().setFrozen([]);
+  });
+
   it('references only the selected collection asset without placing helper nodes', () => {
     const source = s().addNode('collection', { x: 0, y: 0 }, { role: 'output', items: [
       { id: 'a', assetId: 'a', enabled: true, promptOverride: '' },
@@ -270,6 +309,137 @@ describe('extraction workflow', () => {
     expect(get(ex).data.collectionNodeId).toBeNull();
   });
 
+  it('folds Prompt, Generate and style into the collection button; the collection stays visible', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    const owner = get(made.collection);
+    const style = s().edges.find((e) => e.target === made.generate && e.targetHandle === 'theme')!.source;
+    expect((owner.data as CollectionData).foldedIds!.sort()).toEqual([made.generate, made.prompt!, style].sort());
+    for (const id of [made.generate, made.prompt!, style]) {
+      expect(get(id).data.groupId).toBe(made.collection);
+      expect(get(id).hidden).toBe(true);
+    }
+    expect(owner.hidden).toBeFalsy(); // not folded itself
+    expect(owner.data.groupId).toBeFalsy();
+    s().selectAll();
+    expect(get(made.generate).selected).toBeFalsy(); // hidden nodes are not picked on their own
+    expect(get(made.collection).selected).toBe(true);
+  });
+
+  it('Select all and Delete removes the folded nodes together with their collection', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    s().selectAll();
+    s().deleteSelected();
+    expect(s().nodes).toHaveLength(0);
+    expect(s().edges).toHaveLength(0);
+    s().undo();
+    expect(s().nodes.some((n) => n.id === made.generate)).toBe(true); // one undo brings the whole flow back
+    expect(get(made.generate).hidden).toBe(true);
+  });
+
+  it('duplicating the collection duplicates what is folded into it, and the copy stays folded', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    const before = s().nodes.length;
+    select([made.collection]);
+    s().duplicateSelected();
+    expect(s().nodes).toHaveLength(before + 4); // the collection, Prompt, Generate and style
+    const copy = s().nodes.find((n) => n.type === 'collection' && n.id !== made.collection && (n.data as CollectionData).foldedIds?.length)!;
+    const folded = (copy.data as CollectionData).foldedIds!;
+    expect(folded).toHaveLength(3);
+    for (const id of folded) {
+      expect(get(id).data.groupId).toBe(copy.id);
+      expect(get(id).hidden).toBe(true);
+      expect(get(id).selected).toBeFalsy();
+      expect([made.generate, made.prompt]).not.toContain(id); // new nodes, not the originals
+    }
+    expect((get(made.collection).data as CollectionData).foldedIds).toHaveLength(3); // the original is untouched
+    // The copy's Generate node is wired to the copy's collection, not the original's.
+    const copyGenerate = folded.find((id) => get(id).type === 'generate')!;
+    expect(s().edges.some((e) => e.target === copyGenerate && e.targetHandle === 'original' && e.source === copy.id)).toBe(true);
+  });
+
+  it('copy and paste of the collection also carries the folded nodes', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    select([made.collection]);
+    s().copySelected();
+    s().paste();
+    const copies = s().nodes.filter((n) => n.type === 'collection' && n.id !== made.collection && (n.data as CollectionData).foldedIds?.length);
+    expect(copies).toHaveLength(1);
+    expect(s().nodes.filter((n) => n.type === 'generate')).toHaveLength(2);
+  });
+
+  it('places results on the collection button and ungroup restores every node', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    s().placeResultNode(made.generate, 'batch-1', 3);
+    const results = s().nodes.find((n) => n.type === 'collection' && (n.data as CollectionData).role === 'output')!;
+    const proxy = s().edges.find((e) => e.source === made.collection && e.target === results.id)!;
+    expect(proxy.id.startsWith('wf-')).toBe(true);
+    expect(s().ungroupWorkflow(made.collection)).toBe(true);
+    expect(get(made.collection)).toBeTruthy(); // the collection stays; only its button opens
+    expect((get(made.collection).data as CollectionData).foldedIds).toEqual([]);
+    for (const id of [made.generate, made.prompt!]) {
+      expect(get(id).data.groupId).toBeFalsy();
+      expect(get(id).hidden).toBe(false);
+    }
+    expect(s().edges.some((e) => e.id.startsWith('wf-'))).toBe(false);
+    expect(s().edges.some((e) => e.source === made.generate && e.target === results.id)).toBe(true);
+  });
+
+  it('deleting the collection deletes the nodes folded behind it', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    const style = s().edges.find((e) => e.target === made.generate && e.targetHandle === 'theme')!.source;
+    s().eraseItems({ nodeIds: [made.collection] });
+    for (const id of [made.collection, made.generate, made.prompt!, style]) expect(s().nodes.some((n) => n.id === id)).toBe(false);
+    expect(s().edges.some((e) => e.source === made.generate || e.target === made.generate)).toBe(false);
+  });
+
+  it('the Delete key path removes the folded nodes with their collection, and never one of them alone', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    s().onNodesChange([{ type: 'remove', id: made.generate }]); // a folded node alone: refused
+    expect(s().nodes.some((n) => n.id === made.generate)).toBe(true);
+    s().onNodesChange([{ type: 'remove', id: made.collection }]);
+    expect(s().nodes.some((n) => n.id === made.collection || n.id === made.generate || n.id === made.prompt)).toBe(false);
+  });
+
+  it('a collection with a running folded Generate node cannot be deleted', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    s().setFrozen([made.generate]);
+    const kept = s().eraseItems({ nodeIds: [made.collection] });
+    expect(kept).toBe(1);
+    expect(s().nodes.some((n) => n.id === made.collection)).toBe(true);
+    select([made.collection]);
+    s().deleteSelected();
+    expect(s().nodes.some((n) => n.id === made.generate)).toBe(true);
+    s().setFrozen([]);
+  });
+
+  it('refuses to ungroup while its Generate node is running', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    s().setFrozen([made.generate]);
+    expect(s().ungroupWorkflow(made.collection)).toBe(false);
+    expect((get(made.collection).data as CollectionData).foldedIds).toHaveLength(3);
+    s().setFrozen([]);
+  });
+
+  it('a rebuild keeps the flow folded and adds no second button', async () => {
+    const { ex } = found();
+    const made = (await s().addExtractionWorkflow(ex))!;
+    const count = s().nodes.length;
+    s().updateNodeData(ex, { off: [0] });
+    await s().addExtractionWorkflow(ex);
+    expect(s().nodes).toHaveLength(count);
+    expect((get(made.collection).data as CollectionData).foldedIds).toHaveLength(3);
+    expect(get(made.generate).hidden).toBe(true);
+  });
+
   it('reuses collection and Generate while preserving edited art direction', async () => {
     const { ex } = found();
     const first = (await s().addExtractionWorkflow(ex))!;
@@ -337,6 +507,7 @@ describe('extraction workflow', () => {
   it('copied workflows keep their own collection and Generate references', async () => {
     const { ex, src } = found();
     const made = (await s().addExtractionWorkflow(ex))!;
+    expect(s().ungroupWorkflow(made.collection)).toBe(true); // a folded flow is not copied; its nodes are
     select([ex, src, made.collection, made.prompt!, made.generate]);
     s().copySelected(); s().paste();
     const copied = s().nodes.filter((n) => n.selected);

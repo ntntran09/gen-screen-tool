@@ -24,6 +24,7 @@ import {
   type NodeDataByKind,
 } from '../graph/types';
 import { nodeAssetId } from '../graph/collections';
+import { appendSnippet, availableSnippets, connectedPorts, hasSnippet } from '../graph/promptSnippets';
 import { useImageImport } from '../hooks/useImageImport';
 import { formatDuration, taskMs } from '../hooks/useBatchTime';
 import { useImageRoles } from '../hooks/useImageRoles';
@@ -31,7 +32,7 @@ import { api, assetUrls, type ProviderInfo } from '../lib/api';
 import { copyText } from '../lib/clipboard';
 import { pickImageFiles } from '../lib/filePicker';
 import { useAssetStore } from '../store/assetStore';
-import { latestAttempts, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
+import { isRunning, latestAttempts, latestBatchFor, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
 import { isNodeFrozen, useGraphStore } from '../store/graphStore';
 import { AssetThumb, formatBytes } from './AssetThumb';
 import { ExtractFields } from './ExtractFields';
@@ -51,7 +52,14 @@ const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 
 type Update = (patch: Partial<AnyNodeData>) => void;
 
-function PromptFields({ data, update }: { data: PromptData; update: Update }) {
+function PromptFields({ nodeId, data, update }: { nodeId: string; data: PromptData; update: Update }) {
+  // A joined string keeps the selector result stable between renders.
+  const wiring = useGraphStore((s) => {
+    const { feeds, ports } = connectedPorts(nodeId, s.nodes, s.edges);
+    return `${feeds ? 1 : 0}:${[...ports].sort().join(',')}`;
+  });
+  const [feedsFlag, portList] = wiring.split(':');
+  const snippets = availableSnippets(feedsFlag === '1', new Set(portList ? portList.split(',') : []));
   return (
     <Section
       title=""
@@ -71,6 +79,28 @@ function PromptFields({ data, update }: { data: PromptData; update: Update }) {
           </>
         }
       />
+      <div className="space-y-1.5">
+        <p className="text-[11px] font-medium text-ink-2">Add to prompt</p>
+        <p className="text-[11px] text-ink-3">Reference, palette and theme sentences show when that input is connected to the Generate node.</p>
+        <div className="flex flex-wrap gap-1.5">
+          {snippets.map((snippet) => {
+            const added = hasSnippet(data.text, snippet.text);
+            return (
+              <button
+                key={snippet.id}
+                type="button"
+                disabled={added || data.locked}
+                title={added ? 'Already in the prompt' : snippet.text}
+                onClick={() => update({ text: appendSnippet(data.text, snippet.text) })}
+                className="rounded-full border border-line px-2 py-0.5 text-[11px] text-ink-2 hover:bg-accent-soft hover:text-ink disabled:cursor-default disabled:bg-panel-2 disabled:opacity-60"
+              >
+                {added ? '✓ ' : '+ '}
+                {snippet.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
       <Toggle label="Enabled" checked={data.enabled} onChange={(enabled) => update({ enabled })} />
     </Section>
   );
@@ -435,8 +465,25 @@ function CollectionFields({ nodeId, data, update }: { nodeId: string; data: Coll
   const enabled = items.filter((i) => i.enabled).length;
   const overrides = items.filter((i) => i.promptOverride.trim()).length;
   const canAdd = !data.locked && data.role === 'input';
+  const folded = data.foldedIds ?? [];
+  const foldedGenerateId = useGraphStore((s) => (folded.length ? s.nodes.find((n) => n.type === 'generate' && folded.includes(n.id))?.id : undefined));
+  const foldedBatch = useGenerationStore((s) => (foldedGenerateId ? latestBatchFor(s.batches, foldedGenerateId) : null));
+  const foldedRunning = useGenerationStore((s) => Boolean(foldedGenerateId && s.starting[foldedGenerateId])) || isRunning(foldedBatch);
   return (
     <>
+      {foldedGenerateId && (
+        <Section title="Workflow" note="The Prompt, Generate and style Image nodes are folded into this collection's generate button. Ungroup to edit the prompt, quality or other settings.">
+          <Button variant="primary" disabled={foldedRunning || data.locked} onClick={() => void useGenerationStore.getState().start(foldedGenerateId)}>
+            {foldedRunning ? 'Generating…' : 'Generate'}
+          </Button>
+          {foldedBatch && OPEN_STATUSES.includes(foldedBatch.status) && (
+            <Button disabled={foldedBatch.cancel_requested} onClick={() => void useGenerationStore.getState().cancel(foldedBatch.id)}>
+              {foldedBatch.cancel_requested ? 'Cancelling…' : 'Cancel'}
+            </Button>
+          )}
+          <Button disabled={foldedRunning} onClick={() => useGraphStore.getState().ungroupWorkflow(nodeId)}>Ungroup</Button>
+        </Section>
+      )}
       <Section title="Collection">
         <div className="flex flex-wrap gap-2">
           <IconAction icon="preview" label="Open collection" onClick={() => useAssetStore.getState().openViewer(nodeId)} />
@@ -723,7 +770,7 @@ export function Inspector() {
           <input type="color" aria-label="Drawing color" value={String(d.color)} onChange={(e) => update({ color: e.target.value })} className="size-8 cursor-pointer" />
           <NumberInput label="Width" value={(d as NodeDataByKind['drawing']).strokeWidth} min={1} max={12} onChange={(strokeWidth) => update({ strokeWidth })} />
         </Section>}
-        {node.type === 'prompt' && <PromptFields data={d as PromptData} update={update} />}
+        {node.type === 'prompt' && <PromptFields nodeId={node.id} data={d as PromptData} update={update} />}
         {node.type === 'image' && <ImageFields nodeId={node.id} data={d as ImageData} update={update} />}
         {node.type === 'output' && <OutputFields node={node} />}
         {node.type === 'palette' && <PaletteFields nodeId={node.id} data={d as PaletteData} update={update} />}

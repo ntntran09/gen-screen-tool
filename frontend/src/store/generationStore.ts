@@ -26,6 +26,13 @@ function variationSettings(batch?: GenerationBatch, task?: GenerationTask): Part
   };
 }
 
+/** The original image(s) a result was made from, sent with a variation so the model keeps the context. */
+export function variationContext(task: GenerationTask | undefined, assetId: string): string[] {
+  const request = task?.request;
+  const ids = [request?.original_asset_id, ...(request?.extra_original_asset_ids ?? [])];
+  return [...new Set(ids.filter((id): id is string => typeof id === 'string' && id !== '' && id !== assetId))];
+}
+
 /** Batch states that still have (or wait for) work. */
 export const OPEN_STATUSES: readonly BatchStatus[] = ['queued', 'running', 'paused', 'interrupted'];
 const RUNNING_STATUSES: readonly BatchStatus[] = ['queued', 'running'];
@@ -70,6 +77,24 @@ export function latestAttempts(tasks: GenerationTask[] | undefined): GenerationT
     if (!cur || t.attempt_number > cur.attempt_number) bySlot.set(t.slot_index, t);
   }
   return [...bySlot.values()].sort((a, b) => a.slot_index - b.slot_index);
+}
+
+export interface FailureReason {
+  message: string;
+  count: number;
+}
+
+/** Why the latest attempts failed, grouped by message, most common first. */
+export function failureReasons(tasks: GenerationTask[] | undefined): FailureReason[] {
+  const byMessage = new Map<string, FailureReason>();
+  for (const t of latestAttempts(tasks)) {
+    if (t.status !== 'failed' && t.status !== 'interrupted') continue;
+    const message = (t.error_message ?? t.error_code ?? 'Failed').trim();
+    const seen = byMessage.get(message);
+    if (seen) seen.count += 1;
+    else byMessage.set(message, { message, count: 1 });
+  }
+  return [...byMessage.values()].sort((a, b) => b.count - a.count);
 }
 
 /** Most recent batch of a Generate node, if any. */
@@ -176,10 +201,11 @@ export const useGenerationStore = create<GenerationState>()((set, get) => {
       try {
         const g = useGraphStore.getState();
         if (!g.projectId) throw new Error('No project is open.');
-        const settings = variationSettings(batchId ? get().batches[batchId] : undefined, batchId ? get().tasks[batchId]?.find((t) => t.id === taskId) : undefined);
+        const sourceTask = batchId ? get().tasks[batchId]?.find((t) => t.id === taskId) : undefined;
+        const settings = variationSettings(batchId ? get().batches[batchId] : undefined, sourceTask);
         const id = uuid();
         const nodes = g.nodes.map((n) => n.id === nodeId ? { ...n, data: { ...n.data,
-          inlineGeneration: { id, assetId, prompt: VARIATION_PROMPT, settings, batchIds: [] },
+          inlineGeneration: { id, assetId, prompt: VARIATION_PROMPT, settings, batchIds: [], contextAssetIds: variationContext(sourceTask, assetId) },
         } } : n);
         const preview = await api.previewGeneration({ project_id: g.projectId, generate_node_id: id,
           graph: toInlineGenerationPayload(toGraphPayload(nodes, g.edges, g.viewport), nodeId) });
@@ -348,7 +374,8 @@ export const useGenerationStore = create<GenerationState>()((set, get) => {
       let accepted = false;
       try {
         const settings = variationSettings(batchId ? get().batches[batchId] : undefined, batchId ? get().tasks[batchId]?.find((t) => t.id === taskId) : undefined);
-        const id = useGraphStore.getState().placeInlineResult(nodeId, assetId, prompt.trim() || VARIATION_PROMPT, newBatchId, settings, undefined, 'Varied result', 'variation');
+        const sourceTask = batchId ? get().tasks[batchId]?.find((t) => t.id === taskId) : undefined;
+        const id = useGraphStore.getState().placeInlineResult(nodeId, assetId, prompt.trim() || VARIATION_PROMPT, newBatchId, settings, undefined, 'Varied result', 'variation', variationContext(sourceTask, assetId));
         if (!id) return false;
         const g = useGraphStore.getState();
         const graph = toGraphPayload(g.nodes, g.edges, g.viewport);

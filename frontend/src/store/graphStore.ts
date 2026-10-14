@@ -96,7 +96,7 @@ interface GraphState {
   /** Replace a collection's items. Pass a coalesce key for typing so one edit is one undo step. */
   setCollectionItems: (id: string, items: CollectionItem[], coalesceKey?: string) => void;
   expandCollection: (id: string, itemIds?: string[]) => void;
-  placeInlineResult: (nodeId: string, assetId: string, prompt: string, batchId: string, settings?: Partial<GenerateData>, pending?: { slot_index: number; attempt_number: number }, title?: string, resultAction?: OutputData['resultAction']) => string | null;
+  placeInlineResult: (nodeId: string, assetId: string, prompt: string, batchId: string, settings?: Partial<GenerateData>, pending?: { slot_index: number; attempt_number: number }, title?: string, resultAction?: OutputData['resultAction'], contextAssetIds?: string[]) => string | null;
   /** Turn single-image nodes (default: the selection) into one Input Collection. Returns its id. */
   groupIntoCollection: (ids?: string[]) => string | null;
   /**
@@ -108,6 +108,13 @@ interface GraphState {
   addExtractionWorkflow: (extractNodeId: string) => Promise<{ collection: string; prompt: string | null; generate: string; count: number; created: boolean } | null>;
   /** Replace an Input Collection with one Original node per item. */
   ungroupCollection: (id: string) => void;
+  /** Open a collection's folded generate button back into its nodes. Returns false when it cannot (e.g. generating). */
+  ungroupWorkflow: (groupId: string) => boolean;
+  /**
+   * Open a node's inline generation (the sparkle button on a result) into a real Prompt and Generate node.
+   * The Generate node keeps the inline generation's id, so its earlier runs stay attached to it.
+   */
+  ungroupInlineGeneration: (nodeId: string) => boolean;
   /**
    * Create (or reuse) the node that receives a new batch's results, connected to the Generate
    * node: an Output Image for one expected result, an Output Collection for several (spec §16.4).
@@ -150,8 +157,42 @@ function withFlags(node: CanvasNode): CanvasNode {
   const locked = isNodeLocked(node);
   const draggable = !node.data.locked;
   const frozen = frozenIds.has(node.id);
-  if (node.draggable === draggable && node.deletable === !locked && node.connectable === !frozen) return node;
-  return { ...node, draggable, deletable: !locked, connectable: !frozen };
+  const hidden = Boolean(node.data.groupId); // folded into a Workflow button
+  if (node.draggable === draggable && node.deletable === !locked && node.connectable === !frozen && Boolean(node.hidden) === hidden) return node;
+  return { ...node, draggable, deletable: !locked, connectable: !frozen, hidden };
+}
+
+/** Edges drawn from a collection's generate button to the results of the folded Generate node. */
+const FOLD_EDGE = 'wf-';
+const foldEdge = (owner: string, target: string, handle: string): CanvasEdge => ({
+  id: `${FOLD_EDGE}${owner}-${nanoid(8)}`, source: owner, sourceHandle: 'out', target, targetHandle: handle,
+});
+
+/**
+ * Nodes folded into a collection's generate button are never picked on their own (they are hidden):
+ * selecting, copying, duplicating or deleting the owner collection takes its folded nodes with it.
+ */
+const isFolded = (n: CanvasNode) => Boolean(n.data.groupId);
+
+/** The ids plus every node folded into an owner among them. */
+function withFoldedMembers(nodes: CanvasNode[], ids: Set<string>): Set<string> {
+  const all = new Set(ids);
+  for (const n of nodes) if (ids.has(n.id)) for (const id of (n.data as CollectionData).foldedIds ?? []) all.add(id);
+  return all;
+}
+
+/** An owner cannot be deleted while a node folded into it is generating or locked. */
+const blockedByFolded = (nodes: CanvasNode[], owner: CanvasNode) =>
+  ((owner.data as CollectionData).foldedIds ?? []).some((id) => {
+    const member = nodes.find((n) => n.id === id);
+    return member ? isNodeLocked(member) : false;
+  });
+
+/** A folded node whose owner collection no longer exists comes back (a safety net; removals take them along). */
+function releaseOrphans(nodes: CanvasNode[]): CanvasNode[] {
+  const ids = new Set(nodes.map((n) => n.id));
+  if (!nodes.some((n) => n.data.groupId && !ids.has(n.data.groupId))) return nodes;
+  return nodes.map((n) => (n.data.groupId && !ids.has(n.data.groupId) ? withFlags({ ...n, data: { ...n.data, groupId: null } as AnyNodeData }) : n));
 }
 
 function stripSelection(snapshot: Snapshot): Snapshot {
@@ -173,17 +214,17 @@ function cloneSubgraph(source: Snapshot, offset: number): Snapshot {
       height: n.height,
       // Assets are referenced by id, never copied, so a pasted node points at the same file.
       // A copied Output Collection keeps its images but no longer receives the original's batches.
-      data: n.data.inlineGeneration
+      data: (n.data.inlineGeneration
         ? { ...structuredClone(n.data), ...(n.type === 'collection' ? { batchIds: [] } : {}),
           inlineGeneration: { ...structuredClone(n.data.inlineGeneration), id: uuid(), batchIds: [] } }
         : n.type === 'collection'
-        ? { ...structuredClone(n.data), batchIds: [] }
+        ? { ...structuredClone(n.data), batchIds: [], foldedIds: ((n.data as CollectionData).foldedIds ?? []).flatMap((m) => idMap.get(m) ?? []) }
         : n.type === 'extract'
           ? { ...structuredClone(n.data), generateNodeId: idMap.get((n.data as ExtractData).generateNodeId ?? '') ?? null, collectionNodeId: idMap.get((n.data as ExtractData).collectionNodeId ?? '') ?? null }
-          : structuredClone(n.data),
-      selected: true,
+          : structuredClone(n.data)) as AnyNodeData,
+      selected: !n.data.groupId,
     });
-  });
+  }).map((n) => (n.data.groupId ? withFlags({ ...n, data: { ...n.data, groupId: idMap.get(n.data.groupId as string) ?? null } as AnyNodeData }) : n));
   const edges = source.edges
     .filter((e) => idMap.has(e.source) && idMap.has(e.target))
     .map((e) => ({
@@ -359,10 +400,18 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     onNodesChange: (changes) => {
       const canMove = get().tool === 'select' || get().tool === 'pan';
       changes = changes.filter((c) => c.type !== 'position' || !c.position || canMove);
-      changes = changes.filter((c) => c.type !== 'remove' || !get().nodes.some((n) => n.id === c.id && isNodeLocked(n)));
+      changes = changes.filter((c) => c.type !== 'remove' || !get().nodes.some((n) => n.id === c.id && (isNodeLocked(n) || blockedByFolded(get().nodes, n))));
+      {
+        // Removing an owner collection removes what is folded into it; a folded node goes only with its owner.
+        const current = get().nodes;
+        const removing = new Set(changes.filter((c) => c.type === 'remove').map((c) => c.id));
+        const all = withFoldedMembers(current, removing);
+        changes = changes.filter((c) => c.type !== 'remove' || !current.some((n) => n.id === c.id && isFolded(n)) || removing.has(String(current.find((n) => n.id === c.id)?.data.groupId)));
+        for (const id of all) if (!removing.has(id)) changes.push({ type: 'remove', id });
+      }
       changes = changes.map((c) => c.type === 'dimensions' && c.setAttributes && get().nodes.some((n) => n.id === c.id && n.type === 'text')
         ? { ...c, setAttributes: 'width' as const } : c);
-      set({ nodes: applyNodeChanges(changes, get().nodes).map(withFlags) });
+      set({ nodes: releaseOrphans(applyNodeChanges(changes, get().nodes).map(withFlags)) });
       if (changes.some((c) => c.type === 'position' || c.type === 'remove' || (c.type === 'dimensions' && c.setAttributes))) {
         touch();
       }
@@ -491,7 +540,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       })));
     },
 
-    placeInlineResult: (nodeId, assetId, prompt, batchId, settings = {}, pending, title, resultAction) => {
+    placeInlineResult: (nodeId, assetId, prompt, batchId, settings = {}, pending, title, resultAction, contextAssetIds = []) => {
       const { nodes, edges, commit } = get();
       const source = nodes.find((n) => n.id === nodeId);
       if (!source || isNodeLocked(source)) return null;
@@ -507,7 +556,8 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       commit();
       set({ nodes: [...nodes.map((n) => n.id === source.id ? { ...n, data: { ...n.data,
         inlineGeneration: { id: generationId, assetId, prompt: prompt.trim(), settings,
-          batchIds: [...new Set([...(source.data.inlineGeneration?.batchIds ?? []), batchId])] },
+          batchIds: [...new Set([...(source.data.inlineGeneration?.batchIds ?? []), batchId])],
+          ...(contextAssetIds.length ? { contextAssetIds } : {}) },
       } } : n), result], edges: [...edges,
         { id: uuid(), source: source.id, sourceHandle: 'out', target: result.id, targetHandle: 'edit' },
       ] });
@@ -642,17 +692,109 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       else nextNodes.push(styleNode);
       if (!oldGenerate) nextNodes.push(generate);
       if (prompt) nextNodes.push(prompt);
+      const nextEdges = [
+        ...edges.filter((e) => !(e.target === generate.id && e.targetHandle === 'original') && !(e.target === collection.id && e.targetHandle === 'extract')),
+        wire(extractNodeId, collection.id, 'extract'), wire(collection.id, generate.id, 'original'),
+        ...(prompt ? [wire(prompt.id, generate.id, 'prompt')] : []),
+        ...(styleOld ? [] : [wire(styleNode.id, generate.id, 'theme')]),
+      ];
+      // Fold the Prompt, Generate and style Image into the Cropped assets collection's generate button.
+      // The folded nodes stay in the graph, hidden, so planning and generation do not change.
+      const memberIds = [...new Set([generate.id, promptEdge ? promptEdge.source : prompt?.id, styleNode.id].filter((id): id is string => Boolean(id)))];
+      const folded = nextNodes.map((n) => {
+        if (memberIds.includes(n.id)) return withFlags({ ...n, selected: false, data: { ...n.data, groupId: collection.id } as AnyNodeData });
+        if (n.id === collection.id) return { ...n, selected: true, data: { ...n.data, foldedIds: memberIds } as AnyNodeData };
+        return n;
+      });
+      // Results hang off the button: the hidden Generate node's own edges to them are hidden with it.
+      const shown = (target: string, handle: string) => nextEdges.some((e) => e.source === collection.id && e.target === target && e.targetHandle === handle && e.id.startsWith(FOLD_EDGE));
+      for (const e of nextEdges.filter((x) => x.source === generate.id)) {
+        if (!shown(e.target, e.targetHandle ?? 'in')) nextEdges.push(foldEdge(collection.id, e.target, e.targetHandle ?? 'in'));
+      }
+      set({ nodes: folded, edges: nextEdges });
+      touch();
+      return { collection: collection.id, prompt: prompt?.id ?? null, generate: generate.id, count: assets.length, created: !oldGenerate };
+    },
+
+    ungroupWorkflow: (groupId) => {
+      const { nodes, edges, commit, showToast } = get();
+      const owner = nodes.find((n) => n.id === groupId && n.type === 'collection');
+      const members = new Set((owner?.data as CollectionData | undefined)?.foldedIds ?? []);
+      if (!owner || members.size === 0) return false;
+      if ([...members].some((id) => frozenIds.has(id))) {
+        showToast('This workflow is generating. Ungroup it when the run ends.', 'error');
+        return false;
+      }
+      if (owner.data.locked) {
+        showToast('This collection is locked. Unlock it first.', 'error');
+        return false;
+      }
+      commit();
       set({
-        nodes: nextNodes,
+        nodes: nodes.map((n) => {
+          if (members.has(n.id)) return withFlags({ ...n, selected: true, data: { ...n.data, groupId: null } as AnyNodeData });
+          if (n.id === groupId) return { ...n, selected: false, data: { ...n.data, foldedIds: [] } as AnyNodeData };
+          return n.selected ? { ...n, selected: false } : n;
+        }),
+        edges: edges.filter((e) => !e.id.startsWith(`${FOLD_EDGE}${groupId}-`)),
+      });
+      touch();
+      return true;
+    },
+
+    ungroupInlineGeneration: (nodeId) => {
+      const { nodes, edges, commit, showToast } = get();
+      const source = nodes.find((n) => n.id === nodeId);
+      const inline = source?.data.inlineGeneration;
+      if (!source || !inline) return false;
+      if (frozenIds.has(nodeId) || frozenIds.has(inline.id)) {
+        showToast('This is generating. Ungroup it when the run ends.', 'error');
+        return false;
+      }
+      if (source.data.locked) {
+        showToast('This node is locked. Unlock it first.', 'error');
+        return false;
+      }
+      commit();
+      const direct = (source.type === 'output' || source.type === 'image') && nodeAssetId(source) === inline.assetId;
+      const prompt = withFlags({
+        id: uuid(), type: 'prompt', selected: false,
+        position: findFreeSpot({ x: source.position.x + 60, y: source.position.y + 420 }, nodes),
+        data: { ...getDefinition('prompt').defaultData(), text: inline.prompt } as AnyNodeData,
+      });
+      const generate = withFlags({
+        id: inline.id, type: 'generate', selected: true,
+        position: findFreeSpot({ x: prompt.position.x + 320, y: prompt.position.y }, [...nodes, prompt]),
+        data: { ...getDefinition('generate').defaultData(), ...inline.settings, title: inline.settings.title ?? 'Edit result',
+          editResult: true, mode: 'manual', outputCount: 1, aspectRatio: 'match', primaryOriginalNodeId: null } as AnyNodeData,
+      });
+      const image = direct ? null : withFlags({
+        id: uuid(), type: 'image', selected: false,
+        position: findFreeSpot({ x: prompt.position.x, y: prompt.position.y + 300 }, [...nodes, prompt, generate]),
+        data: { ...getDefinition('image').defaultData(), assetId: inline.assetId } as AnyNodeData,
+      });
+      const wire = (from: string, to: string, handle: string): CanvasEdge => ({
+        id: `e-${nanoid(10)}`, source: from, sourceHandle: 'out', target: to, targetHandle: handle,
+      });
+      // The results of earlier runs hang off the Generate node now, as they would have from the start.
+      const results = nodes.filter((n) => n.type === 'output' && n.data.sourceNodeId === source.id
+        && inline.batchIds.includes(String(n.data.generationId)) && !edges.some((e) => e.target === n.id && e.targetHandle === 'in'));
+      const { inlineGeneration: _removed, ...rest } = source.data;
+      void _removed;
+      set({
+        nodes: [
+          ...nodes.map((n) => (n.id === source.id ? { ...n, selected: false, data: rest as AnyNodeData } : n.selected ? { ...n, selected: false } : n)),
+          prompt, generate, ...(image ? [image] : []),
+        ],
         edges: [
-          ...edges.filter((e) => !(e.target === generate.id && e.targetHandle === 'original') && !(e.target === collection.id && e.targetHandle === 'extract')),
-          wire(extractNodeId, collection.id, 'extract'), wire(collection.id, generate.id, 'original'),
-          ...(prompt ? [wire(prompt.id, generate.id, 'prompt')] : []),
-          ...(styleOld ? [] : [wire(styleNode.id, generate.id, 'theme')]),
+          ...edges,
+          wire(prompt.id, generate.id, 'prompt'),
+          wire(direct ? source.id : image!.id, generate.id, 'original'),
+          ...results.map((r) => wire(generate.id, r.id, 'in')),
         ],
       });
       touch();
-      return { collection: collection.id, prompt: prompt?.id ?? null, generate: generate.id, count: assets.length, created: !oldGenerate };
+      return true;
     },
 
     ungroupCollection: (id) => {
@@ -718,11 +860,14 @@ export const useGraphStore = create<GraphState>()((set, get) => {
         position: findFreeSpot({ x: gen.position.x + 320, y: gen.position.y }, nodes),
         data: data as AnyNodeData,
       });
+      const groupId = gen.data.groupId;
       set({
         nodes: [...nodes, node],
         edges: [
           ...edges,
           { id: `e-${nanoid(10)}`, source: generateId, sourceHandle: 'out', target: node.id, targetHandle: 'in' },
+          // A folded Generate is hidden: its results visibly hang off the Workflow button instead.
+          ...(groupId ? [foldEdge(groupId, node.id, 'in')] : []),
         ],
       });
       touch();
@@ -791,8 +936,8 @@ export const useGraphStore = create<GraphState>()((set, get) => {
 
     deleteSelected: () => {
       const { nodes, edges, commit, showToast } = get();
-      const removable = new Set(nodes.filter((n) => n.selected && !isNodeLocked(n)).map((n) => n.id));
-      const lockedSelected = nodes.some((n) => n.selected && isNodeLocked(n));
+      const removable = withFoldedMembers(nodes, new Set(nodes.filter((n) => n.selected && !isFolded(n) && !isNodeLocked(n) && !blockedByFolded(nodes, n)).map((n) => n.id)));
+      const lockedSelected = nodes.some((n) => n.selected && !isFolded(n) && (isNodeLocked(n) || blockedByFolded(nodes, n)));
       const edgeIds = new Set(edges.filter((e) => e.selected && !isNodeFrozen(e.source) && !isNodeFrozen(e.target)).map((e) => e.id));
       if (removable.size === 0 && edgeIds.size === 0) {
         if (lockedSelected) showToast('Locked nodes cannot be deleted. Unlock them first.');
@@ -800,7 +945,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       }
       commit();
       set({
-        nodes: nodes.filter((n) => !removable.has(n.id)),
+        nodes: releaseOrphans(nodes.filter((n) => !removable.has(n.id))),
         edges: edges.filter((e) => !edgeIds.has(e.id) && !removable.has(e.source) && !removable.has(e.target)),
       });
       if (lockedSelected) showToast('Locked nodes were kept.');
@@ -810,8 +955,8 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     eraseItems: ({ nodeIds = [], edgeIds = [] }, coalesceKey) => {
       const { nodes, edges, commit } = get();
       const wanted = new Set(nodeIds);
-      const removable = new Set(nodes.filter((n) => wanted.has(n.id) && !isNodeLocked(n)).map((n) => n.id));
-      const kept = nodes.filter((n) => wanted.has(n.id) && isNodeLocked(n)).length;
+      const removable = withFoldedMembers(nodes, new Set(nodes.filter((n) => wanted.has(n.id) && !isFolded(n) && !isNodeLocked(n) && !blockedByFolded(nodes, n)).map((n) => n.id)));
+      const kept = nodes.filter((n) => wanted.has(n.id) && (isNodeLocked(n) || blockedByFolded(nodes, n))).length;
       // A connection into or out of a generating node stays until the batch ends.
       const edgeSet = new Set(edgeIds.filter((id) => {
         const e = edges.find((x) => x.id === id);
@@ -820,16 +965,16 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       const nextEdges = edges.filter((e) => !edgeSet.has(e.id) && !removable.has(e.source) && !removable.has(e.target));
       if (removable.size === 0 && nextEdges.length === edges.length) return kept;
       commit(coalesceKey);
-      set({ nodes: nodes.filter((n) => !removable.has(n.id)), edges: nextEdges });
+      set({ nodes: releaseOrphans(nodes.filter((n) => !removable.has(n.id))), edges: nextEdges });
       touch();
       return kept;
     },
 
     copySelected: () => {
       const { nodes, edges } = get();
-      const selected = nodes.filter((n) => n.selected);
+      const ids = withFoldedMembers(nodes, new Set(nodes.filter((n) => n.selected && !isFolded(n)).map((n) => n.id)));
+      const selected = nodes.filter((n) => ids.has(n.id));
       if (selected.length === 0) return;
-      const ids = new Set(selected.map((n) => n.id));
       set({
         clipboard: structuredClone(
           stripSelection({ nodes: selected, edges: edges.filter((e) => ids.has(e.source) && ids.has(e.target)) }),
@@ -853,9 +998,9 @@ export const useGraphStore = create<GraphState>()((set, get) => {
 
     duplicateSelected: () => {
       const { nodes, edges, commit } = get();
-      const selected = nodes.filter((n) => n.selected);
+      const ids = withFoldedMembers(nodes, new Set(nodes.filter((n) => n.selected && !isFolded(n)).map((n) => n.id)));
+      const selected = nodes.filter((n) => ids.has(n.id));
       if (selected.length === 0) return;
-      const ids = new Set(selected.map((n) => n.id));
       commit();
       const copy = cloneSubgraph(
         { nodes: selected, edges: edges.filter((e) => ids.has(e.source) && ids.has(e.target)) },
@@ -869,7 +1014,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     },
 
     selectAll: () =>
-      set((s) => ({ nodes: s.nodes.map((n) => (n.selected ? n : { ...n, selected: true })) })),
+      set((s) => ({ nodes: s.nodes.map((n) => (n.selected || isFolded(n) ? n : { ...n, selected: true })) })),
   };
 });
 

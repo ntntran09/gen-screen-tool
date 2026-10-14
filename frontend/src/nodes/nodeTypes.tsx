@@ -11,6 +11,7 @@ import type {
 } from '../graph/types';
 import { aspectLabel, PRESETS } from '../graph/types';
 import { AssetCaption, AssetThumb, MiniThumb } from '../components/AssetThumb';
+import { FailureReasons } from '../components/FailureReasons';
 import { MunLoader } from '../components/MunLoader';
 import { OutputPlaceholder } from '../components/OutputPlaceholder';
 import { estimateTasks } from '../graph/generation';
@@ -110,8 +111,58 @@ const PREVIEW_SLOTS = 8;
 const nodeBtn =
   'nodrag rounded-md border-2 border-outline bg-node px-2 py-0.5 text-[11px] font-medium text-ink hover:bg-accent-soft';
 
+/** Run controls of the Extract flow folded into a collection's generate button: progress, cancel and Generate. */
+function FoldedRun({ generateId, locked }: { generateId: string; locked: boolean }) {
+  const batch = useGenerationStore((s) => latestBatchFor(s.batches, generateId));
+  const starting = useGenerationStore((s) => Boolean(s.starting[generateId]));
+  const expected = useGraphStore((s) => estimateTasks(s.nodes, s.edges, generateId));
+  const time = useBatchTime(batch?.id);
+  const running = starting || isRunning(batch);
+  const open = Boolean(batch && OPEN_STATUSES.includes(batch.status));
+  const done = batch ? batch.completed_count + batch.failed_count + batch.cancelled_count : 0;
+  return (
+    <div className="mt-2 space-y-1.5 text-[11px]">
+      {batch && (open || batch.failed_count > 0) && (
+        <>
+          <div className="flex items-center gap-1.5">
+            <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full border border-outline bg-panel-2" aria-hidden>
+              <div className="h-full bg-success" style={{ width: `${(100 * done) / Math.max(1, batch.expected_count)}%` }} />
+            </div>
+            {open && (
+              <button type="button" aria-label="Cancel generation" disabled={batch.cancel_requested}
+                title="Cancel: stops the images not sent yet. A request already sent cannot be stopped; its image is kept if it arrives."
+                className="nodrag flex size-4 shrink-0 items-center justify-center rounded-full border border-outline bg-node text-ink-2 hover:bg-danger-soft hover:text-danger disabled:cursor-wait disabled:opacity-40"
+                onClick={() => void useGenerationStore.getState().cancel(batch.id)}>
+                <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" aria-hidden="true">
+                  <path d="m5 5 14 14M19 5 5 19" />
+                </svg>
+              </button>
+            )}
+          </div>
+          <p className="text-ink-2">
+            {batch.completed_count}/{batch.expected_count} done
+            {batch.failed_count > 0 && <span className="text-danger"> · {batch.failed_count} failed</span>}
+            {time && <span className="font-mono tabular-nums">{' · '}{time.live ? '⏱ ' : 'took '}{formatDuration(time.ms)}</span>}
+          </p>
+          <FailureReasons batchId={batch.id} />
+        </>
+      )}
+      <button
+        type="button"
+        disabled={running || locked || expected === 0}
+        onClick={() => void useGenerationStore.getState().start(generateId)}
+        className="nodrag w-full rounded-lg border-2 border-outline bg-accent py-1.5 text-[12px] font-semibold text-accent-ink hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {running ? 'Generating…' : `Generate ${expected}`}
+      </button>
+    </div>
+  );
+}
+
 function CollectionNode(props: P) {
   const data = props.data as CollectionData;
+  const folded = data.foldedIds ?? [];
+  const foldedGenerateId = useGraphStore((s) => (folded.length ? s.nodes.find((n) => n.type === 'generate' && folded.includes(n.id))?.id : undefined));
   const items = data.items ?? [];
   const lastBatchId = data.role === 'output' ? data.batchIds?.at(-1) : undefined;
   const batch = useGenerationStore((s) => (lastBatchId ? s.batches[lastBatchId] : undefined));
@@ -130,6 +181,7 @@ function CollectionNode(props: P) {
       node={props}
       width={260}
       hiddenInputs={data.role === 'input' ? ['in'] : ['extract']}
+      outputSymbol={Boolean(foldedGenerateId)}
       badge={<span className="text-[10px] uppercase tracking-wide text-ink-3">{data.role}</span>}
     >
       {items.length === 0 ? (
@@ -180,6 +232,8 @@ function CollectionNode(props: P) {
           {outTime && <span className="font-mono tabular-nums"> · {formatDuration(outTime.ms)}</span>}
         </p>
       )}
+      {batch && batch.failed_count > 0 && <div className="mt-1"><FailureReasons batchId={batch.id} /></div>}
+      {foldedGenerateId && <FoldedRun generateId={foldedGenerateId} locked={Boolean(data.locked)} />}
       <div className="mt-2 flex items-center gap-2 text-[12px]">
         <span className="text-ink-2">
           {items.length} {items.length === 1 ? 'image' : 'images'}
@@ -207,7 +261,9 @@ function ExtractNode(props: P) {
   const { detect } = useExtractStore.getState();
   const found = currentDetections(data, assetId);
   const chosen = found ? found.items.filter((_, i) => !data.off.includes(i)).length : 0;
-  // One main action: find first; the inspector has the review and the Redraw button.
+  // One main action: find the assets first, then build the asset sheet from the ticked ones.
+  // Finding again is in the inspector.
+  const hasFound = Boolean(found && found.items.length > 0);
   return (
     <NodeShell node={props} width={260}>
       <div className="space-y-1.5 text-[12px] text-ink-2">
@@ -225,12 +281,12 @@ function ExtractNode(props: P) {
       {assetId && (
         <button
           type="button"
-          disabled={busy !== undefined || data.locked}
+          disabled={busy !== undefined || data.locked || (hasFound && chosen === 0)}
           aria-busy={busy !== undefined}
-          onClick={() => void detect(props.id)}
+          onClick={() => void (hasFound ? useExtractStore.getState().build(props.id) : detect(props.id))}
           className="nodrag mt-2 w-full rounded-lg border-2 border-outline bg-accent py-1.5 text-[12px] font-semibold text-accent-ink hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {busy === 'detect' ? 'Looking…' : found ? 'Find again' : 'Find assets'}
+          {busy === 'detect' ? 'Looking…' : busy === 'crop' ? 'Cutting assets…' : hasFound ? `Build asset sheet (${chosen})` : 'Find assets'}
         </button>
       )}
     </NodeShell>
@@ -306,6 +362,7 @@ function GenerateNode(props: P) {
               </span>
             )}
           </p>
+          {!running && <FailureReasons batchId={batch.id} />}
           {batch.status_reason && !running && <p className="text-warning">{batch.status_reason}</p>}
           <div className="flex gap-1.5">
             {(batch.status === 'paused' || batch.status === 'interrupted') && batch.active_count > 0 && (

@@ -266,7 +266,7 @@ def build_plan(
 
     preset = str(d.get("preset") or presets.DEFAULT_PRESET)
     if preset not in presets.TEMPLATES:
-        errors.append("Choose a preset on the Generate node: Game screen restyle or Asset sheet.")
+        errors.append("Choose a preset on the Generate node: Game screen restyle, Asset sheet or Free prompt.")
         preset = presets.DEFAULT_PRESET
 
     def asset_ok(asset_id: Any, owner: str) -> bool:
@@ -424,7 +424,13 @@ def build_plan(
         next_image = 1
         if source:
             next_image = 2 + len(extras)
-            if extras:
+            if extras and edit_result:
+                # A variation or edit of a generated result: the originals it came from are context only.
+                notes.append(
+                    f"- Context: {_images_phrase(2, len(extras))} the original image(s) this result was made from. "
+                    "Use them only as context, to keep the style, details and composition consistent, and edit image 1."
+                )
+            elif extras:
                 notes.append(
                     f"- Additional originals: {_images_phrase(2, len(extras))} also provided as originals (secondary); "
                     "use them together with image 1."
@@ -444,12 +450,12 @@ def build_plan(
                 for c in palette
             ]
             notes.append("- Color palette: use " + ", ".join(colors) + ".")
-        if palette or theme_ids:
+        if (palette or theme_ids) and preset != presets.FREE:  # a free prompt has no gameplay to protect
             notes.append(
                 "- Keep the main gameplay objects vivid. Even if the palette or style references are muted or pale, they "
                 "must stay saturated, high-contrast and clearly stand out from the background, supports and HUD. Use the "
                 "palette and style references for the overall look and secondary elements, not to wash out the key objects. "
-                "Objects that are told apart by color for gameplay must keep their original colors; other elements may follow the palette and theme."
+                "Objects that are told apart by color for gameplay must keep their original colors but still be redrawn in the theme's art style; other elements may follow the palette and theme."
             )
         if source and source.override:
             notes.append(f"- For this image: {fill(source.override)}")

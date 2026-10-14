@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -176,6 +178,66 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("COMMIT")
 
 
+def fold_legacy_workflow_nodes(conn: sqlite3.Connection, db_path: Path, backups_dir: Path) -> None:
+    """Move the short-lived stand-alone `workflow` node into the collection that owns the folded flow.
+
+    The Prompt, Generate and style Image nodes of an Extract flow are folded into the Cropped assets
+    collection (`foldedIds` there, `groupId` on each folded node). An earlier build kept that list on a
+    separate `workflow` node, which is no longer a known node type. Idempotent.
+    """
+    legacy = conn.execute("SELECT id, project_id, data_json FROM nodes WHERE type = 'workflow'").fetchall()
+    if not legacy:
+        return
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    shutil.copy2(db_path, backups_dir / f"database-{stamp}-pre-workflow-fold.sqlite")
+    ts = now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for row in legacy:
+            project_id = row[1]
+            data = json.loads(row[2])
+            members = [m for m in data.get("memberIds", []) if isinstance(m, str)]
+            generate_id = data.get("generateNodeId")
+            owner = conn.execute(
+                "SELECT n.id, n.data_json FROM edges e JOIN nodes n ON n.id = e.source_node_id"
+                " WHERE e.project_id = ? AND e.target_node_id = ? AND e.target_handle = 'original' AND n.type = 'collection'",
+                (project_id, generate_id),
+            ).fetchone()
+            for member_id in members:
+                found = conn.execute("SELECT data_json FROM nodes WHERE id = ? AND project_id = ?", (member_id, project_id)).fetchone()
+                if found is None:
+                    continue
+                member = json.loads(found[0])
+                if owner is not None:
+                    member["groupId"] = owner[0]
+                else:  # nothing to fold into: show the node again
+                    member.pop("groupId", None)
+                conn.execute("UPDATE nodes SET data_json = ?, updated_at = ? WHERE id = ?", (json.dumps(member), ts, member_id))
+            if owner is not None:
+                owner_data = json.loads(owner[1])
+                owner_data["foldedIds"] = members
+                conn.execute("UPDATE nodes SET data_json = ?, updated_at = ? WHERE id = ?", (json.dumps(owner_data), ts, owner[0]))
+                # The folded Generate node is hidden: its results hang off the collection's button.
+                for edge in conn.execute(
+                    "SELECT target_node_id, target_handle FROM edges WHERE project_id = ? AND source_node_id = ?",
+                    (project_id, generate_id),
+                ).fetchall():
+                    conn.execute(
+                        "INSERT INTO edges (id, project_id, source_node_id, source_handle, target_node_id, target_handle)"
+                        " VALUES (?, ?, ?, 'out', ?, ?)",
+                        (f"wf-{owner[0]}-{uuid.uuid4().hex[:8]}", project_id, owner[0], edge[0], edge[1]),
+                    )
+            conn.execute("DELETE FROM edges WHERE source_node_id = ? OR target_node_id = ?", (row[0], row[0]))
+            conn.execute("DELETE FROM nodes WHERE id = ?", (row[0],))
+            conn.execute("UPDATE projects SET graph_revision = graph_revision + 1, updated_at = ? WHERE id = ?", (ts, project_id))
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def migrate(db_path: Path, backups_dir: Path) -> None:
     """Apply pending migrations. Backs up an existing database first (spec §27.4)."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,6 +250,7 @@ def migrate(db_path: Path, backups_dir: Path) -> None:
         applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
         pending = [(v, sql) for v, sql in MIGRATIONS if v not in applied]
         if not pending:
+            fold_legacy_workflow_nodes(conn, db_path, backups_dir)
             return
         if existed:
             backups_dir.mkdir(parents=True, exist_ok=True)
@@ -203,5 +266,6 @@ def migrate(db_path: Path, backups_dir: Path) -> None:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
+        fold_legacy_workflow_nodes(conn, db_path, backups_dir)
     finally:
         conn.close()

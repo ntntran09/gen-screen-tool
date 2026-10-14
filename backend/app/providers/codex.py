@@ -132,7 +132,9 @@ class CodexProvider(ImageProvider):
         await self.auth.access_token(force_refresh=True)
         return await self._headers()
 
-    async def analyze_image(self, image: bytes, prompt: str, *, instructions: str, model: str) -> AnalysisResult:
+    async def analyze_image(
+        self, image: bytes, prompt: str, *, instructions: str, model: str, effort: str = "low"
+    ) -> AnalysisResult:
         """Ask a small chat model about an image through the Codex Responses endpoint (text only, no drawing).
 
         Request shape follows community tools (Hermes Agent, the Codex CLI); like the image calls it is
@@ -144,7 +146,7 @@ class CodexProvider(ImageProvider):
             "store": False,
             "stream": True,
             "instructions": instructions,
-            "reasoning": {"effort": "low"},
+            "reasoning": {"effort": effort},
             "input": [
                 {
                     "type": "message",

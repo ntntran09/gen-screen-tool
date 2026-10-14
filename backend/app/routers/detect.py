@@ -30,8 +30,10 @@ Cfg = Annotated[Settings, Depends(get_settings)]
 class DetectBody(BaseModel):
     provider_id: str = "codex"
     hint: str = Field(default="", max_length=300)
-    # Empty means the configured default list. The reasoning effort is not selectable: it stays "low".
+    # Empty means the configured default list.
     model: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9._:-]*$")
+    # Empty picks the model's default: maximum for Luna, light for the larger models.
+    effort: str = Field(default="", pattern=r"^(|low|medium|high|xhigh|max)$")
 
 
 @router.post("/api/assets/{asset_id}/detect")
@@ -49,7 +51,7 @@ async def detect(asset_id: str, body: DetectBody, conn: Conn, settings: Cfg, reg
         raise ApiError(exc.status, exc.code, exc.message) from None
     started = time.monotonic()
     try:
-        found, model = await detect_assets(provider, data, (body.model,) if body.model else settings.vision_models, body.hint)
+        found, model = await detect_assets(provider, data, (body.model,) if body.model else settings.vision_models, body.hint, body.effort or None)
     except ProviderError as exc:
         status = {"AUTH_REQUIRED": 409, "AUTH_EXPIRED": 409, "RATE_LIMITED": 429, "QUOTA_EXCEEDED": 429}.get(exc.code, 502)
         raise ApiError(status, exc.code, exc.message) from None

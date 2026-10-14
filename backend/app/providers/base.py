@@ -104,6 +104,8 @@ class ImageProvider(ABC):
     @abstractmethod
     def normalize_error(self, exc: BaseException) -> ProviderError: ...
 
-    async def analyze_image(self, image: bytes, prompt: str, *, instructions: str, model: str) -> AnalysisResult:
+    async def analyze_image(
+        self, image: bytes, prompt: str, *, instructions: str, model: str, effort: str = "low"
+    ) -> AnalysisResult:
         """Look at an image with a small chat model and answer in text. Optional capability."""
         raise ProviderError("UNSUPPORTED_CAPABILITY", f"{self.name} cannot analyse images.")

@@ -112,17 +112,23 @@ export function toInlineGenerationPayload(graph: GraphPayload, sourceId: string)
   const promptId = `${inline.id}:prompt`;
   const direct = ['output', 'image'].includes(source.type) && source.data.assetId === inline.assetId;
   const originalId = direct ? source.id : `${inline.id}:image`;
+  // Variation keeps the original image in the request for context: it travels as a secondary original,
+  // the image being varied stays the primary one (image 1).
+  const context = [...new Set(inline.contextAssetIds ?? [])].filter((id) => id !== inline.assetId);
   return { ...graph, nodes: [...graph.nodes,
     { id: promptId, type: 'prompt', position: source.position, data: { ...getDefinition('prompt').defaultData(), text: inline.prompt } },
     { id: inline.id, type: 'generate', position: source.position, data: {
       ...getDefinition('generate').defaultData(), ...inline.settings, title: inline.settings.title ?? 'Edit result',
-      editResult: true, mode: 'manual', outputCount: 1, aspectRatio: 'match', primaryOriginalNodeId: null,
+      editResult: true, mode: 'manual', outputCount: 1, aspectRatio: 'match', primaryOriginalNodeId: context.length ? originalId : null,
     } },
+    ...context.map((assetId, i) => ({ id: `${inline.id}:context:${i}`, type: 'image', position: source.position,
+      data: { ...getDefinition('image').defaultData(), assetId } })),
     ...(!direct ? [{ id: originalId, type: 'image', position: source.position,
       data: { ...getDefinition('image').defaultData(), assetId: inline.assetId } }] : []),
   ], edges: [...graph.edges,
     { id: `${inline.id}:original`, source: originalId, sourceHandle: 'out', target: inline.id, targetHandle: 'original' },
     { id: `${inline.id}:request`, source: promptId, sourceHandle: 'out', target: inline.id, targetHandle: 'prompt' },
+    ...context.map((_, i) => ({ id: `${inline.id}:context-edge:${i}`, source: `${inline.id}:context:${i}`, sourceHandle: 'out', target: inline.id, targetHandle: 'original' })),
   ] };
 }
 
@@ -146,8 +152,8 @@ export const api = {
     request<{ deleted: string[] }>('POST', `/projects/${encodeURIComponent(projectId)}/assets/delete`, { asset_ids: assetIds }),
   assetPalette: (id: string, count: number) =>
     request<{ colors: { hex: string; share: number }[] }>('GET', `/assets/${encodeURIComponent(id)}/palette?count=${count}`),
-  detectAssets: (assetId: string, providerId: string, hint: string, model = '') =>
-    request<DetectResult>('POST', `/assets/${encodeURIComponent(assetId)}/detect`, { provider_id: providerId, hint, model }),
+  detectAssets: (assetId: string, providerId: string, hint: string, model = '', effort = '') =>
+    request<DetectResult>('POST', `/assets/${encodeURIComponent(assetId)}/detect`, { provider_id: providerId, hint, model, effort }),
   cropAssets: (assetId: string, boxes: Pick<DetectedAsset, 'name' | 'x' | 'y' | 'w' | 'h'>[]) =>
     request<{ assets: AssetInfo[] }>('POST', `/assets/${encodeURIComponent(assetId)}/crop`, { boxes }),
   assetOriginPrompts: (id: string) =>
@@ -260,6 +266,8 @@ export interface GenerationTask {
   request: {
     operation: 'generate' | 'edit';
     original_asset_id: string | null;
+    /** Manual runs with several originals: the secondary ones sent along with the primary. */
+    extra_original_asset_ids?: string[];
     theme_asset_ids: string[];
     reference_asset_ids: string[];
     settings: Record<string, string | number>;

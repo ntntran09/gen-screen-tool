@@ -2,6 +2,7 @@ import type { OutputData } from '../graph/types';
 import { formatDuration, useBatchTime } from '../hooks/useBatchTime';
 import { isRunning, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
 import { AssetThumb } from './AssetThumb';
+import { FailureReasons } from './FailureReasons';
 import { MunLoader } from './MunLoader';
 
 /** The saved action survives reloads, renames and collaboration updates. */
@@ -16,6 +17,7 @@ export function OutputPlaceholder({ data }: { data: OutputData }) {
   return (
     <div>
       <MunLoader variant={action === 'retry' ? 'erasing' : 'placing'} label={null} playing={live} />
+      {!live && batch && batch.failed_count > 0 && <div className="mt-1.5"><FailureReasons batchId={batch.id} max={1} /></div>}
       {(live || cancellable) && (
         <p role="status" className="mt-1.5 flex items-center justify-center gap-2 text-[11px] text-ink-2">
           <span className="font-mono tabular-nums" title="Time spent generating this image">

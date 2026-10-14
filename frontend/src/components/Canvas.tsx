@@ -29,6 +29,7 @@ import type { CanvasEdge, CanvasNode, CollectionData, NodeKind, NodeDataByKind }
 import { checkConnection } from '../graph/validation';
 import { nodeTypes } from '../nodes/nodeTypes';
 import { isNodeFrozen, isNodeLocked, useGraphStore, type CanvasTool } from '../store/graphStore';
+import { isRunning, latestBatchFor, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
 import { isSupportedImage, useAssetPlacement, useImageImport, type ImportTarget } from '../hooks/useImageImport';
 import { isTypingTarget } from '../hooks/useShortcuts';
 import { useAssetStore } from '../store/assetStore';
@@ -131,6 +132,26 @@ function dropTarget(e: DragEvent, count: number): ImportTarget {
   return { screen: { x: e.clientX, y: e.clientY }, group: !e.altKey };
 }
 
+/** Right-click items of a collection that has the Extract flow folded into its generate button. */
+function workflowItems(node: CanvasNode): MenuItem[] {
+  const folded = (node.data as CollectionData).foldedIds ?? [];
+  const generateId = useGraphStore.getState().nodes.find((n) => n.type === 'generate' && folded.includes(n.id))?.id;
+  if (!generateId) return [];
+  const gen = useGenerationStore.getState();
+  const batch = latestBatchFor(gen.batches, generateId);
+  const open = Boolean(batch && OPEN_STATUSES.includes(batch.status));
+  const running = isRunning(batch) || Boolean(gen.starting[generateId]);
+  return [
+    { label: 'Run', disabled: running || node.data.locked, hint: running ? 'Already generating' : undefined,
+      onSelect: () => void useGenerationStore.getState().start(generateId) },
+    ...(open && batch ? [{ label: 'Cancel generation', danger: true, disabled: batch.cancel_requested,
+      hint: 'Stops the images not sent yet; a request already sent cannot be stopped',
+      onSelect: () => void useGenerationStore.getState().cancel(batch.id) }] : []),
+    { label: 'Ungroup', disabled: running, hint: running ? 'Wait for the run to finish' : 'Open into the Prompt, Generate and style nodes',
+      onSelect: () => { useGraphStore.getState().ungroupWorkflow(node.id); } },
+  ];
+}
+
 export function Canvas() {
   const nodes = useGraphStore((s) => s.nodes);
   const edges = useGraphStore((s) => s.edges);
@@ -226,6 +247,14 @@ export function Canvas() {
         y: e.clientY,
         title: String(node.data.title || getDefinition(node.type!).label),
         items: [
+          ...(node.type === 'collection' && (node.data as CollectionData).foldedIds?.length ? workflowItems(node) : []),
+          ...(node.data.inlineGeneration ? [{
+            label: 'Ungroup',
+            disabled: isNodeFrozen(node.id) || isNodeFrozen(node.data.inlineGeneration.id) || node.data.locked,
+            hint: isNodeFrozen(node.id) || isNodeFrozen(node.data.inlineGeneration.id) ? 'Wait for the run to finish'
+              : node.data.locked ? 'Locked nodes cannot be changed' : 'Open the sparkle button into a Prompt and a Generate node',
+            onSelect: () => { useGraphStore.getState().ungroupInlineGeneration(node.id); },
+          }] : []),
           {
             label: 'Duplicate',
             onSelect: () => {
@@ -238,7 +267,9 @@ export function Canvas() {
             label: 'Delete node',
             danger: true,
             disabled: isNodeLocked(node),
-            hint: isNodeFrozen(node.id) ? 'Generating: it can be deleted when the run ends' : node.data.locked ? 'Locked nodes cannot be deleted' : undefined,
+            hint: isNodeFrozen(node.id) ? 'Generating: it can be deleted when the run ends'
+              : node.data.locked ? 'Locked nodes cannot be deleted'
+              : (node.data as CollectionData).foldedIds?.length ? 'Deletes the collection and the nodes folded into it' : undefined,
             onSelect: () => erase({ nodeIds: [node.id] }),
           },
         ],
@@ -276,7 +307,7 @@ export function Canvas() {
     if (!projectId) return;
     let seen = true;
     try { seen = sessionStorage.getItem(`nodecanvas:viewport:${projectId}`) !== null; } catch { /* storage unavailable */ }
-    const bounds = seen ? null : mainClusterBounds(useGraphStore.getState().nodes);
+    const bounds = seen ? null : mainClusterBounds(useGraphStore.getState().nodes.filter((n) => !n.data.groupId));
     if (bounds) void fitBounds(bounds, { padding: 0.15 });
     else void applyViewport(useGraphStore.getState().viewport);
   }, [projectId, applyViewport, fitBounds]);

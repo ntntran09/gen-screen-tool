@@ -1,8 +1,15 @@
 import { useEffect, useId, useRef, useState, type PointerEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { drawnCrop, type CropBox } from '../graph/cropBox';
+import { dragBox, drawnCrop, type CropBox, type DragMode } from '../graph/cropBox';
 import type { DetectedAsset } from '../graph/types';
 import { assetUrls } from '../lib/api';
+
+/** Handle name, left, top, cursor: positions on the crop box outline. */
+const HANDLES: [DragMode, string, string, string][] = [
+  ['nw', '0%', '0%', 'nwse-resize'], ['n', '50%', '0%', 'ns-resize'], ['ne', '100%', '0%', 'nesw-resize'],
+  ['w', '0%', '50%', 'ew-resize'], ['e', '100%', '50%', 'ew-resize'],
+  ['sw', '0%', '100%', 'nesw-resize'], ['s', '50%', '100%', 'ns-resize'], ['se', '100%', '100%', 'nwse-resize'],
+];
 
 const button = 'rounded-md border-2 border-outline px-3 py-1.5 text-[12px] hover:bg-accent-soft disabled:opacity-40';
 
@@ -15,6 +22,7 @@ export function CropEditor({ assetId, item, onSave, onClose }: {
   const dialog = useRef<HTMLDialogElement>(null);
   const clipId = useId();
   const start = useRef<{ x: number; y: number } | null>(null);
+  const drag = useRef<{ mode: DragMode; origin: CropBox; from: { x: number; y: number } } | null>(null);
   const [box, setBox] = useState<CropBox>(item);
   const [failed, setFailed] = useState(false);
   const [size, setSize] = useState({ width: 1, height: 1 });
@@ -29,18 +37,27 @@ export function CropEditor({ assetId, item, onSave, onClose }: {
     return { x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height };
   };
   const draw = (e: PointerEvent<HTMLDivElement>) => {
+    if (drag.current) {
+      const p = point(e);
+      setBox(dragBox(drag.current.origin, drag.current.mode, p.x - drag.current.from.x, p.y - drag.current.from.y));
+      return;
+    }
     if (!start.current) return;
     const next = drawnCrop(start.current, point(e));
     if (next) setBox(next);
   };
-  const change = (key: keyof CropBox, value: number) => {
-    if (!Number.isFinite(value)) return;
-    setBox((old) => {
-      const next = { ...old, [key]: Math.max(key === 'w' || key === 'h' ? 0.001 : 0, Math.min(key === 'x' || key === 'y' ? 0.999 : 1, value / 100)) };
-      next.w = Math.min(next.w, 1 - next.x);
-      next.h = Math.min(next.h, 1 - next.y);
-      return next;
-    });
+  const press = (e: PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || failed) return;
+    const mode = (e.target as HTMLElement).dataset.drag as DragMode | undefined;
+    // Grabbing the box or one of its handles moves or resizes it; anywhere else draws a new box.
+    if (mode) drag.current = { mode, origin: box, from: point(e) };
+    else start.current = point(e);
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const release = (e: PointerEvent<HTMLDivElement>) => {
+    draw(e);
+    start.current = null;
+    drag.current = null;
   };
   return createPortal(
     <dialog ref={dialog} aria-labelledby="crop-title" onCancel={onClose}
@@ -53,15 +70,19 @@ export function CropEditor({ assetId, item, onSave, onClose }: {
       
       <div className="flex flex-wrap items-start justify-center gap-4">
         <div className="relative max-w-full touch-none select-none overflow-hidden border-2 border-outline bg-panel-2"
-          onPointerDown={(e) => { if (e.button !== 0 || failed) return; start.current = point(e); e.currentTarget.setPointerCapture(e.pointerId); }}
+          onPointerDown={press}
           onPointerMove={draw}
-          onPointerUp={(e) => { draw(e); start.current = null; }}
-          onPointerCancel={() => { start.current = null; }}>
+          onPointerUp={release}
+          onPointerCancel={() => { start.current = null; drag.current = null; }}>
           <img src={assetUrls.file(assetId)} alt="Source image. Drag to draw a crop." draggable={false}
             onLoad={(e) => setSize({ width: e.currentTarget.naturalWidth, height: e.currentTarget.naturalHeight })}
             onError={() => setFailed(true)} className="block max-h-[58vh] max-w-full cursor-crosshair" />
-          {!failed && <div className="pointer-events-none absolute border-2 border-accent bg-accent/10"
-            style={{ left: `${box.x * 100}%`, top: `${box.y * 100}%`, width: `${box.w * 100}%`, height: `${box.h * 100}%` }} />}
+          {!failed && <div data-drag="move" className="absolute cursor-move border-2 border-accent bg-accent/10"
+            style={{ left: `${box.x * 100}%`, top: `${box.y * 100}%`, width: `${box.w * 100}%`, height: `${box.h * 100}%` }}>
+            {HANDLES.map(([mode, left, top, cursor]) => <span key={mode} data-drag={mode} aria-hidden="true"
+              className="absolute size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-sm border-2 border-accent bg-panel"
+              style={{ left, top, cursor }} />)}
+          </div>}
         </div>
         <div className="w-56 max-w-full space-y-3">
           <p className="text-[12px] font-medium">Crop preview</p>
@@ -72,14 +93,7 @@ export function CropEditor({ assetId, item, onSave, onClose }: {
               <image href={assetUrls.file(assetId)} width={size.width} height={size.height} clipPath={`url(#${clipId})`} />
             </svg>
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            {(['x', 'y', 'w', 'h'] as const).map((key) => <label key={key} className="text-[12px] text-ink-2">
-              {{ x: 'Left', y: 'Top', w: 'Width', h: 'Height' }[key]} (%)
-              <input type="number" min={key === 'x' || key === 'y' ? 0 : 0.1} max={100} step={0.1}
-                value={Number((box[key] * 100).toFixed(2))} onChange={(e) => change(key, e.target.valueAsNumber)}
-                className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-ink" />
-            </label>)}
-          </div>
+          <p className="text-[12px] text-ink-2">Drag the box to move it, drag its edges or corners to resize, or drag on the image to draw a new one.</p>
           {failed && <p role="alert" className="text-[12px] text-danger">Source image could not load. Close and reopen to retry.</p>}
           <button type="button" disabled={failed} className={`${button} w-full bg-accent font-medium text-accent-ink`} onClick={() => onSave(box)}>Save crop</button>
         </div>

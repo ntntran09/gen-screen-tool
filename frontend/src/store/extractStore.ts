@@ -47,7 +47,7 @@ export const useExtractStore = create<ExtractState>()((set, get) => {
         const provider = providers.find((p) => p.auth_state === 'connected')?.id;
         if (!provider) throw new Error('Connect ChatGPT first (the Codex button in the top bar).');
         const hint = dataOf(nodeId)?.hint ?? '';
-        const r = await api.detectAssets(assetId, provider, hint, dataOf(nodeId)?.model ?? '');
+        const r = await api.detectAssets(assetId, provider, hint, dataOf(nodeId)?.model ?? '', dataOf(nodeId)?.effort ?? '');
         useGraphStore.getState().updateNodeData(nodeId, {
           detections: { assetId, model: r.model, seconds: r.elapsed_seconds, items: r.assets },
           off: [],

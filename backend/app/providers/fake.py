@@ -52,7 +52,9 @@ class FakeProvider(ImageProvider):
         img.save(buf, "PNG")
         return GenerateResult(image_bytes=buf.getvalue(), mime_type="image/png", reported_model="placeholder")
 
-    async def analyze_image(self, image: bytes, prompt: str, *, instructions: str, model: str) -> AnalysisResult:
+    async def analyze_image(
+        self, image: bytes, prompt: str, *, instructions: str, model: str, effort: str = "low"
+    ) -> AnalysisResult:
         """A fixed 2x2 "detection" so the whole Find-assets flow can be tried without quota."""
         await asyncio.sleep(self.delay / 2)
         boxes = [

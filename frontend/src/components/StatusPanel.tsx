@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import type { GenerationBatch } from '../lib/api';
 import { formatDuration, useBatchTime } from '../hooks/useBatchTime';
-import { OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
+import { failureReasons, OPEN_STATUSES, useGenerationStore } from '../store/generationStore';
 import { useGraphStore } from '../store/graphStore';
 
 const STATUS_LABEL: Record<GenerationBatch['status'], string> = {
@@ -17,6 +17,13 @@ const STATUS_LABEL: Record<GenerationBatch['status'], string> = {
 };
 
 const linkBtn = 'rounded px-1 font-medium text-ink-2 underline-offset-2 hover:text-ink hover:underline';
+
+/** "2 failed", with the reasons on hover. */
+function FailedCount({ batchId, count }: { batchId: string; count: number }) {
+  const tasks = useGenerationStore((s) => s.tasks[batchId]);
+  const reasons = failureReasons(tasks).map((r) => `${r.count > 1 ? `${r.count}× ` : ''}${r.message}`).join('\n');
+  return <span title={reasons || 'Open the Generate node or Inspector to see why'}>{` · ${count} failed`}</span>;
+}
 
 function JobTime({ batchId }: { batchId: string }) {
   const time = useBatchTime(batchId);
@@ -51,7 +58,7 @@ function Jobs() {
           <span className={b.status === 'failed' || b.status === 'paused' ? 'text-danger' : ''}>{STATUS_LABEL[b.status]}</span>
           <span>
             {b.completed_count}/{b.expected_count}
-            {b.failed_count > 0 && ` · ${b.failed_count} failed`}
+            {b.failed_count > 0 && <FailedCount batchId={b.id} count={b.failed_count} />}
             {b.cancelled_count > 0 && ` · ${b.cancelled_count} cancelled`}
           </span>
           <JobTime batchId={b.id} />

@@ -8,7 +8,16 @@ import { useGraphStore } from '../store/graphStore';
 import { Button, Section, Select, TextInput } from './fields';
 import { CropEditor } from './CropEditor';
 
-const VISION_MODELS = ['gpt-6-luna', 'gpt-5.6-luna'];
+/** Models the ChatGPT account lists that accept images. Luna is the cheap tier; the others are larger. */
+const VISION_MODELS = ['gpt-6-luna', 'gpt-5.6-luna', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra'];
+const EFFORTS = [
+  { value: '', label: 'Auto' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'Extra high' },
+  { value: 'max', label: 'Max' },
+];
 
 /** Inspector for an Extract Assets node: find the assets, review them, then crop them and build background removal. */
 export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: ExtractData; update: (p: Partial<ExtractData>) => void }) {
@@ -37,7 +46,7 @@ export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: 
     <>
       <Section
         title="Find assets"
-        note="A small ChatGPT model finds the separate visual assets in your image, including objects, characters and UI elements. Thinking is kept light. It uses a little of your ChatGPT usage."
+        note="A ChatGPT model finds the separate visual assets in your image, including objects, characters and UI elements. It uses some of your ChatGPT usage."
       >
         {assetId ? (
           <p className="text-[12px] text-ink-2">
@@ -54,7 +63,14 @@ export function ExtractFields({ nodeId, data, update }: { nodeId: string; data: 
             ...[...VISION_MODELS, ...(data.model && !VISION_MODELS.includes(data.model) ? [data.model] : [])].map((m) => ({ value: m, label: m })),
           ]}
           onChange={(model) => update({ model })}
-          hint="Default tries gpt-6-luna, then gpt-5.6-luna."
+          hint="Default tries gpt-6-luna, then gpt-5.6-luna. Larger models locate boxes more accurately but use more of your ChatGPT usage."
+        />
+        <Select
+          label="Thinking"
+          value={data.effort ?? ''}
+          options={EFFORTS}
+          onChange={(effort) => update({ effort })}
+          hint="Auto: maximum for Luna models, low for larger ones. Higher is slower."
         />
         <TextInput label="Find" value={data.hint} onChange={(hint) => update({ hint })} placeholder="e.g. flowers and pots only; no HUD" />
         <Button variant="primary" disabled={!assetId || busy !== undefined} onClick={() => void detect(nodeId)}>

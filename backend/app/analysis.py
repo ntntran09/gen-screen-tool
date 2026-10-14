@@ -112,16 +112,29 @@ def shrink_for_model(data: bytes) -> bytes:
         return buf.getvalue()
 
 
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def default_effort(model: str) -> str:
+    """Luna is the small, cheap tier and mislocates boxes at low effort, so it thinks as long as it can.
+    The larger models are accurate enough that light thinking keeps a search quick."""
+    return "max" if "luna" in model else "low"
+
+
 async def detect_assets(
-    provider: ImageProvider, image: bytes, models: tuple[str, ...], hint: str = ""
+    provider: ImageProvider, image: bytes, models: tuple[str, ...], hint: str = "", effort: str | None = None
 ) -> tuple[list[Detection], str | None]:
-    """Ask the first model the account accepts. Returns the detections and the model that answered."""
+    """Ask the first model the account accepts. Returns the detections and the model that answered.
+
+    `effort` is the reasoning effort; None picks `default_effort` for each model."""
     prompt = PROMPT.format(grid=GRID, hint=(f"- Extra guidance from the user: {hint.strip()[:300]}\n" if hint.strip() else ""))
     small = shrink_for_model(image)
     last: ProviderError | None = None
     for model in models:
         try:
-            result = await provider.analyze_image(small, prompt, instructions=INSTRUCTIONS, model=model)
+            result = await provider.analyze_image(
+                small, prompt, instructions=INSTRUCTIONS, model=model, effort=effort or default_effort(model)
+            )
         except ProviderError as exc:
             last = exc
             # Only a rejected/unknown model is worth trying the next one for; anything else would repeat.
