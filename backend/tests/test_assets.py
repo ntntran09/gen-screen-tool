@@ -12,7 +12,7 @@ from PIL import Image
 from app.config import Settings
 from app.db import MIGRATIONS, migrate
 from app.main import create_app
-from app.assets import AssetError, convert_generated_image
+from app.assets import AssetError, boost_saturation, convert_generated_image
 
 CSRF = {"x-nodecanvas-csrf": "1"}
 
@@ -255,9 +255,26 @@ def test_extract_palette_ignores_transparent_pixels(ctx) -> None:
     res = c.get(f"/api/assets/{a}/palette?count=2")
     assert res.status_code == 200
     colors = res.json()["colors"]
-    assert [x["hex"] for x in colors] == ["#FF0000", "#0000FF"]  # no black from the transparent area
+    assert [x["hex"] for x in colors] == [_hex(boost_saturation((255, 0, 0))), _hex(boost_saturation((0, 0, 255)))]  # no black from the transparent area
     assert colors[0]["share"] > colors[1]["share"]
     assert c.get("/api/assets/00000000-0000-0000-0000-000000000000/palette").status_code == 404
+
+
+def _hex(rgb: tuple[int, int, int]) -> str:
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
+def test_boost_saturation_strengthens_the_colour_a_little_and_keeps_hue_and_lightness() -> None:
+    import colorsys
+
+    for c in [(230, 40, 30), (40, 170, 60), (90, 60, 140), (180, 120, 120)]:
+        boosted = boost_saturation(c)
+        h0, l0, s0 = colorsys.rgb_to_hls(*(v / 255 for v in c))
+        h1, l1, s1 = colorsys.rgb_to_hls(*(v / 255 for v in boosted))
+        assert s1 > s0 and s1 - s0 < 0.15  # more saturated, but only a little
+        assert abs(h1 - h0) < 0.01 and abs(l1 - l0) < 0.01  # same hue and lightness
+    for unchanged in [(255, 0, 0), (0, 0, 255), (128, 128, 128), (255, 255, 255), (0, 0, 0)]:
+        assert boost_saturation(unchanged) == unchanged  # pure colours and greys have nothing to strengthen
 
 
 def _near(hex_: str, rgb: tuple[int, int, int], within: int = 40) -> bool:
@@ -296,4 +313,4 @@ def test_extract_palette_keeps_a_flat_image(ctx) -> None:
     c, pid, _ = ctx
     a = upload(c, pid, ("flat.png", img_bytes("PNG", size=(30, 30)), "image/png")).json()["imported"][0]["id"]
     colors = c.get(f"/api/assets/{a}/palette").json()["colors"]
-    assert [x["hex"] for x in colors] == ["#FF0000"] and colors[0]["share"] == 100
+    assert [x["hex"] for x in colors] == [_hex(boost_saturation((255, 0, 0)))] and colors[0]["share"] == 100

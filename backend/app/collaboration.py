@@ -43,9 +43,24 @@ def validate_frozen_graph(before: Graph, after: Graph, frozen: set[str]) -> None
 
 
 def apply_ops(graph: Graph, ops: list[dict[str, Any]], frozen: set[str] | None = None) -> Graph:
-    nodes = {n.id: n.model_dump() for n in graph.nodes}
-    edges = {e.id: e.model_dump() for e in graph.edges}
+    """Apply edits without copying the whole canvas.
+
+    Untouched nodes and edges are shared with `graph` (same objects), so cost follows the edit size,
+    not the canvas size. Only nodes an op touches are dumped, edited and re-validated.
+    """
+    nodes: dict[str, GraphNode | dict] = {n.id: n for n in graph.nodes}
+    edges: dict[str, GraphEdge] = {e.id: e for e in graph.edges}
     frozen = frozen or set()
+
+    def editable(id_: str) -> dict:
+        node = nodes[id_]
+        if isinstance(node, GraphNode):
+            node = nodes[id_] = node.model_dump()
+        return node
+
+    def blocked_edge(e: GraphEdge) -> bool:
+        return e.source in frozen or e.target in frozen
+
     for op in ops:
         kind, id_ = op.get("kind"), op.get("id")
         if not isinstance(id_, str) or not id_:
@@ -62,9 +77,9 @@ def apply_ops(graph: Graph, ops: list[dict[str, Any]], frozen: set[str] | None =
             patch = op.get("patch")
             if not isinstance(patch, dict) or set(patch) - {"position", "width", "height", "data", "unset"}:
                 raise ApiError(400, "INVALID_EDIT", "Invalid node properties.")
-            node = nodes[id_]
             if "data" in patch and not isinstance(patch["data"], dict):
                 raise ApiError(400, "INVALID_EDIT", "Invalid node data.")
+            node = editable(id_)
             if id_ in frozen:
                 allowed = result_fields(node)
                 properties = {"data"} if node["data"].get("locked") else {"data", "position"}
@@ -74,8 +89,6 @@ def apply_ops(graph: Graph, ops: list[dict[str, Any]], frozen: set[str] | None =
                 if key in patch:
                     node[key] = copy.deepcopy(patch[key])
             if "data" in patch:
-                if not isinstance(patch["data"], dict):
-                    raise ApiError(400, "INVALID_EDIT", "Invalid node data.")
                 node["data"].update(copy.deepcopy(patch["data"]))
             unset = patch.get("unset", [])
             if not isinstance(unset, list) or not all(isinstance(k, str) for k in unset):
@@ -83,26 +96,28 @@ def apply_ops(graph: Graph, ops: list[dict[str, Any]], frozen: set[str] | None =
             for key in unset:
                 node["data"].pop(key, None)
         elif kind == "node_remove":
-            if id_ in frozen or any(id_ in (e["source"], e["target"]) and (e["source"] in frozen or e["target"] in frozen) for e in edges.values()):
+            if id_ in frozen or any(id_ in (e.source, e.target) and blocked_edge(e) for e in edges.values()):
                 raise ApiError(409, "NODE_BUSY", "This node is generating. Wait for it to finish.")
-            nodes.pop(id_, None)
-            edges = {k: e for k, e in edges.items() if id_ not in (e["source"], e["target"])}
+            if nodes.pop(id_, None) is not None:
+                edges = {k: e for k, e in edges.items() if id_ not in (e.source, e.target)}
         elif kind == "edge_add":
             edge = GraphEdge.model_validate(op.get("edge"))
             if edge.id != id_:
                 raise ApiError(400, "INVALID_EDIT", "Edge ID mismatch.")
             if edge.source in nodes and edge.target in nodes:
-                if edge.source in frozen or edge.target in frozen:
+                if blocked_edge(edge):
                     raise ApiError(409, "NODE_BUSY", "Cannot connect a generating node.")
-                edges.setdefault(id_, edge.model_dump())
+                edges.setdefault(id_, edge)
         elif kind == "edge_remove":
             edge = edges.get(id_)
-            if edge and (edge["source"] in frozen or edge["target"] in frozen):
+            if edge and blocked_edge(edge):
                 raise ApiError(409, "NODE_BUSY", "Cannot disconnect a generating node.")
             edges.pop(id_, None)
         else:
             raise ApiError(400, "INVALID_EDIT", "Unknown edit type.")
-    return Graph.model_validate({"nodes": list(nodes.values()), "edges": list(edges.values()), "viewport": graph.viewport})
+    # Only the dict-edited nodes need (re)validation; the rest were validated when first stored.
+    final = [GraphNode.model_validate(n) if isinstance(n, dict) else n for n in nodes.values()]
+    return Graph.model_construct(nodes=final, edges=list(edges.values()), viewport=graph.viewport)
 
 
 def frozen_nodes(conn: sqlite3.Connection, project_id: str, graph: Graph) -> set[str]:
@@ -148,12 +163,12 @@ def persist_changes(conn: sqlite3.Connection, project_id: str, before: Graph, af
     old_nodes, new_nodes = {n.id: n for n in before.nodes}, {n.id: n for n in after.nodes}
     old_edges, new_edges = {e.id: e for e in before.edges}, {e.id: e for e in after.edges}
     for id_, edge in old_edges.items():
-        if new_edges.get(id_) != edge:
+        if new_edges.get(id_) is not edge and new_edges.get(id_) != edge:
             conn.execute("DELETE FROM edges WHERE id = ? AND project_id = ?", (id_, project_id))
     for id_ in old_nodes.keys() - new_nodes.keys():
         conn.execute("DELETE FROM nodes WHERE id = ? AND project_id = ?", (id_, project_id))
     for id_, node in new_nodes.items():
-        if old_nodes.get(id_) == node:
+        if old_nodes.get(id_) is node or old_nodes.get(id_) == node:
             continue
         pos = json.dumps({**node.position, "width": node.width, "height": node.height})
         if id_ in old_nodes:
@@ -163,7 +178,7 @@ def persist_changes(conn: sqlite3.Connection, project_id: str, before: Graph, af
             conn.execute("INSERT INTO nodes (id, project_id, type, position_json, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                          (id_, project_id, node.type, pos, json.dumps(node.data), ts, ts))
     for id_, edge in new_edges.items():
-        if old_edges.get(id_) == edge:
+        if old_edges.get(id_) is edge or old_edges.get(id_) == edge:
             continue
         # Edges are immutable: replacing one requires an explicit remove/add pair.
         conn.execute("INSERT INTO edges (id, project_id, source_node_id, source_handle, target_node_id, target_handle) VALUES (?, ?, ?, ?, ?, ?)",

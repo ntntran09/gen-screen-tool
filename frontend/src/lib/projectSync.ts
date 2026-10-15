@@ -52,7 +52,8 @@ class ProjectConnection {
     this.connect();
     this.heartbeat = setInterval(() => {
       if (this.ready && this.socket?.readyState === WebSocket.OPEN) {
-        if (Date.now() - this.lastMessage > 45_000) this.socket.close();
+        // Hidden tabs get throttled timers (about 1/min), so a silent socket there is not proof of a dead one.
+        if (document.visibilityState === 'visible' && Date.now() - this.lastMessage > 45_000) this.socket.close();
         else this.socket.send(JSON.stringify({ type: 'ping' }));
       }
     }, 15_000);

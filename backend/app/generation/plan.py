@@ -14,6 +14,7 @@ from typing import Any
 from ..schemas import Graph, GraphNode
 from . import presets
 
+FOLD_EDGE_PREFIX = "wf-"  # mirrors FOLD_EDGE in frontend/src/store/graphStore.ts
 MAX_TASKS = 200
 MAX_VARIANTS = 5
 
@@ -165,6 +166,8 @@ def validate_edges(graph: Graph, errors: list[str]) -> None:
     seen: set[tuple[str, str | None, str, str | None]] = set()
     per_port: dict[tuple[str, str | None], int] = {}
     for e in graph.edges:
+        if e.id.startswith(FOLD_EDGE_PREFIX):
+            continue  # display-only shortcut from a folded workflow button to its results; the real edges are checked
         src, dst = nodes.get(e.source), nodes.get(e.target)
         if src is None or dst is None:
             errors.append("A connection points at a node that no longer exists.")

@@ -6,6 +6,7 @@ only the thumbnail is derived. Paths are always built server-side from validated
 
 from __future__ import annotations
 
+import colorsys
 import hashlib
 import io
 import shutil
@@ -289,6 +290,7 @@ _PALETTE_SIZE = 128  # work on a small copy
 _BG_TOLERANCE = 34  # how close to the background colour a pixel must be to count as background
 _MIN_DISTINCT = 46  # chosen colours must differ by at least this much
 _FINE_COLORS = 32  # quantise finely first, then pick the distinct main colours from those
+_PALETTE_SATURATION_BOOST = 0.15  # picked colours get a little more saturated: 15% of the way to full saturation
 
 
 def _dist(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
@@ -329,6 +331,18 @@ def _background_mask(rgb: list[tuple[int, int, int]], opaque: list[bool], w: int
     return mask
 
 
+def boost_saturation(c: tuple[int, int, int], amount: float = _PALETTE_SATURATION_BOOST) -> tuple[int, int, int]:
+    """A slightly more saturated version of the colour: same hue and lightness, saturation raised towards full.
+
+    Greys stay grey (they have no hue to strengthen) and fully saturated colours are unchanged.
+    """
+    h, light, s = colorsys.rgb_to_hls(c[0] / 255, c[1] / 255, c[2] / 255)
+    if s < 0.05:  # a grey has no real hue: boosting it would tint it red
+        return c
+    r, g, b = colorsys.hls_to_rgb(h, light, s + (1 - s) * amount)
+    return round(r * 255), round(g * 255), round(b * 255)
+
+
 def _saturation(c: tuple[int, int, int]) -> float:
     hi, lo = max(c), min(c)
     return 0.0 if hi == 0 else (hi - lo) / hi
@@ -341,6 +355,7 @@ def extract_palette(conn: sqlite3.Connection, settings: Settings, asset_id: str,
     quantised finely, then the palette is picked greedily (area, with a bonus for saturated colours)
     skipping any colour too close to one already chosen, so five picks are five distinct colours
     rather than five shades of the same one. `share` is the area of everything closest to that pick.
+    The returned colours are made a little more saturated (`boost_saturation`).
     """
     row = get_asset_row(conn, asset_id)
     path = asset_file(settings, row)
@@ -381,4 +396,4 @@ def extract_palette(conn: sqlite3.Connection, settings: Settings, asset_id: str,
         area[min(range(len(chosen)), key=lambda k: _dist(c, chosen[k]))] += n
     total = sum(area) or 1
     ranked = sorted(zip(area, chosen, strict=True), reverse=True)
-    return [{"hex": "#{:02X}{:02X}{:02X}".format(*c), "share": round(100 * n / total)} for n, c in ranked]
+    return [{"hex": "#{:02X}{:02X}{:02X}".format(*boost_saturation(c)), "share": round(100 * n / total)} for n, c in ranked]

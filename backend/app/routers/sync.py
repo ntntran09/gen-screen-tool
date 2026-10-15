@@ -42,6 +42,26 @@ async def project_sync(ws: WebSocket, project_id: str) -> None:
                 "name": row["name"], "ack_seq": client["seq"] if client else 0,
                 "resume_ack_seq": resume["seq"] if resume else 0}
 
+    def apply_edit(seq: int, ops: list[dict]) -> tuple[dict | None, int]:
+        """Validate and persist one batch. Returns (snapshot, 0) for an already-acknowledged seq."""
+        row = _get_row(conn, project_id)
+        receipt = conn.execute("SELECT seq FROM sync_clients WHERE project_id = ? AND client_id = ?", (project_id, client_id)).fetchone()
+        ack = receipt["seq"] if receipt else 0
+        if seq <= ack:
+            return snapshot(), 0
+        if seq != ack + 1:
+            raise ApiError(409, "SYNC_SEQUENCE", "Reconnect before sending more changes.")
+        before = rooms.documents.get(project_id) or _load_graph(conn, row)
+        after = apply_ops(before, ops, frozen_nodes(conn, project_id, before))
+        _validate_graph(after)
+        ts, revision = now_iso(), row["graph_revision"] + 1
+        with transaction(conn):
+            persist_changes(conn, project_id, before, after, ts)
+            conn.execute("UPDATE projects SET graph_revision = ?, updated_at = ? WHERE id = ?", (revision, ts, project_id))
+            conn.execute("INSERT INTO sync_clients VALUES (?, ?, ?) ON CONFLICT(project_id, client_id) DO UPDATE SET seq = excluded.seq", (project_id, client_id, seq))
+        rooms.documents[project_id] = after
+        return None, revision
+
     async def send_events() -> None:
         while True:
             event = await queue.get()
@@ -52,7 +72,7 @@ async def project_sync(ws: WebSocket, project_id: str) -> None:
 
     try:
         async with rooms.locks[project_id]:
-            initial = snapshot()
+            initial = await asyncio.to_thread(snapshot)
             await ws.accept()
             rooms.peers[project_id].add(queue)
             queue.put_nowait(initial)
@@ -76,30 +96,18 @@ async def project_sync(ws: WebSocket, project_id: str) -> None:
                         or not all(isinstance(op, dict) for op in ops) or encoded_ops_size(ops) > 900_000):
                     raise ValueError("Invalid edit message.")
                 async with rooms.locks[project_id]:
-                    row = _get_row(conn, project_id)
-                    receipt = conn.execute("SELECT seq FROM sync_clients WHERE project_id = ? AND client_id = ?", (project_id, client_id)).fetchone()
-                    ack = receipt["seq"] if receipt else 0
-                    if seq <= ack:
-                        queue.put_nowait(snapshot())
+                    # SQLite is blocking: keep it off the event loop. The lock keeps one edit at a time.
+                    stale, revision = await asyncio.to_thread(apply_edit, seq, ops)
+                    if stale is not None:
+                        queue.put_nowait(stale)
                         continue
-                    if seq != ack + 1:
-                        raise ApiError(409, "SYNC_SEQUENCE", "Reconnect before sending more changes.")
-                    before = rooms.documents.get(project_id) or _load_graph(conn, row)
-                    after = apply_ops(before, ops, frozen_nodes(conn, project_id, before))
-                    _validate_graph(after)
-                    ts, revision = now_iso(), row["graph_revision"] + 1
-                    with transaction(conn):
-                        persist_changes(conn, project_id, before, after, ts)
-                        conn.execute("UPDATE projects SET graph_revision = ?, updated_at = ? WHERE id = ?", (revision, ts, project_id))
-                        conn.execute("INSERT INTO sync_clients VALUES (?, ?, ?) ON CONFLICT(project_id, client_id) DO UPDATE SET seq = excluded.seq", (project_id, client_id, seq))
-                    rooms.documents[project_id] = after
                     rooms.publish(project_id, {"type": "edit", "client_id": client_id, "seq": seq,
                                                "revision": revision, "ops": ops})
             except (ValueError, TypeError, ValidationError, ApiError, sqlite3.IntegrityError) as exc:
                 code = exc.detail["code"] if isinstance(exc, ApiError) else "INVALID_EDIT"
                 message = exc.detail["message"] if isinstance(exc, ApiError) else "Invalid canvas edit."
                 async with rooms.locks[project_id]:
-                    queue.put_nowait({"type": "rejected", "code": code, "message": message, **{k: v for k, v in snapshot().items() if k != "type"}})
+                    queue.put_nowait({"type": "rejected", "code": code, "message": message, **{k: v for k, v in (await asyncio.to_thread(snapshot)).items() if k != "type"}})
     except (WebSocketDisconnect, RuntimeError):
         pass
     except ApiError:

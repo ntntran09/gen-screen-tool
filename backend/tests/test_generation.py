@@ -250,6 +250,16 @@ def test_server_rejects_wrong_port_and_second_palette() -> None:
     assert any("cannot connect to the theme port" in e for e in errs)
 
 
+def test_folded_workflow_shortcut_edges_are_not_validated() -> None:
+    # A folded workflow draws collection -> result edges for display only; they must not block a run.
+    shortcut = {**edge("c", "out", "in"), "id": "wf-c-abc12345"}
+    g = graph(
+        [gen(), prompt(), node("c", "collection", role="input", items=[]), node("out", "output")],
+        [edge("p", "g", "prompt"), edge("c", "g", "original"), edge("g", "out", "in"), shortcut],
+    )
+    assert not any("cannot connect" in e for e in errors_of(g))
+
+
 def test_server_rejects_cycles() -> None:
     g = graph(
         [gen(), prompt(), node("c", "collection", role="output", items=[]), node("g2", "generate")],
